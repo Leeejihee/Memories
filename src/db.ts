@@ -83,19 +83,32 @@ export function saveAllRegisteredAccounts(accounts: UserAccount[]): void {
 
 export function getPersistedCurrentUser(): UserAccount | null {
   try {
-    const raw = localStorage.getItem(CURRENT_USER_KEY)
-    if (!raw) return null
-    return JSON.parse(raw)
+    const sessionRaw = sessionStorage.getItem(CURRENT_USER_KEY)
+    if (sessionRaw) return JSON.parse(sessionRaw)
+    const localRaw = localStorage.getItem(CURRENT_USER_KEY)
+    if (localRaw) return JSON.parse(localRaw)
+    return null
   } catch {
     return null
   }
 }
 
-export function setPersistedCurrentUser(user: UserAccount | null): void {
-  if (user) {
-    localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(user))
-  } else {
-    localStorage.removeItem(CURRENT_USER_KEY)
+export function setPersistedCurrentUser(user: UserAccount | null, rememberOnDevice: boolean = true): void {
+  try {
+    if (user) {
+      if (rememberOnDevice) {
+        localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(user))
+        sessionStorage.removeItem(CURRENT_USER_KEY)
+      } else {
+        sessionStorage.setItem(CURRENT_USER_KEY, JSON.stringify(user))
+        localStorage.removeItem(CURRENT_USER_KEY)
+      }
+    } else {
+      localStorage.removeItem(CURRENT_USER_KEY)
+      sessionStorage.removeItem(CURRENT_USER_KEY)
+    }
+  } catch (e) {
+    console.warn('Cannot persist user session:', e)
   }
 }
 

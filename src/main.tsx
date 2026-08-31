@@ -162,23 +162,28 @@ const defaultRegisteredAccount: UserAccount = {
 }
 
 function App() {
-  // Accounts & Authentication State
-  const [currentUser, setCurrentUser] = useState<UserAccount>(() => {
-    const existing = getPersistedCurrentUser()
-    if (existing) return existing
+  // Accounts & Authentication State (Isolated per machine / browser session)
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
+    // Seed default account to accounts list if first time on this browser
     const all = getAllRegisteredAccounts()
-    if (all.length > 0) return all[0]
-    saveAllRegisteredAccounts([defaultRegisteredAccount])
-    return defaultRegisteredAccount
+    if (all.length === 0) {
+      saveAllRegisteredAccounts([defaultRegisteredAccount])
+    }
+    // Return active session on this device/browser (null if logged out or fresh device)
+    return getPersistedCurrentUser()
   })
 
-  // Auth Modal State
+  // Device Session Persistence Option
+  const [rememberDeviceOption, setRememberDeviceOption] = useState<boolean>(true)
+
+  // Auth Portal & Modal States
+  const [authPortalTab, setAuthPortalTab] = useState<'login' | 'register'>('login')
   const [showAuthModal, setShowAuthModal] = useState(false)
-  const [authModalTab, setAuthModalTab] = useState<'login' | 'register' | 'change_password' | 'profile'>('login')
+  const [authModalTab, setAuthModalTab] = useState<'profile' | 'change_password' | 'switch_account' | 'supabase'>('profile')
   const [authLoginForm, setAuthLoginForm] = useState({ email: '', password: '' })
   const [authRegisterForm, setAuthRegisterForm] = useState({ name: '', email: '', password: '', confirmPassword: '' })
   const [authPasswordForm, setAuthPasswordForm] = useState({ oldPassword: '', newPassword: '', confirmPassword: '' })
-  const [authProfileForm, setAuthProfileForm] = useState({ name: currentUser.name })
+  const [authProfileForm, setAuthProfileForm] = useState({ name: currentUser?.name || '' })
   const [authError, setAuthError] = useState('')
   const [authSuccess, setAuthSuccess] = useState('')
 
@@ -236,9 +241,9 @@ function App() {
 
   // Supabase Configuration State
   const [supabaseForm, setSupabaseForm] = useState({
-    url: currentUser.supabaseConfig?.url || '',
-    anonKey: currentUser.supabaseConfig?.anonKey || '',
-    syncEnabled: currentUser.supabaseConfig?.syncEnabled || false
+    url: currentUser?.supabaseConfig?.url || '',
+    anonKey: currentUser?.supabaseConfig?.anonKey || '',
+    syncEnabled: currentUser?.supabaseConfig?.syncEnabled || false
   })
   const [supabaseTesting, setSupabaseTesting] = useState(false)
   const [supabaseStatus, setSupabaseStatus] = useState<{ text: string; type: 'success' | 'error' | '' }>({ text: '', type: '' })
@@ -246,19 +251,31 @@ function App() {
 
   // Update Page Title: "<Tên người dùng> - Memories Tìm kỷ niệm nhanh"
   useEffect(() => {
-    const pageTitle = `${currentUser.name} - Memories Tìm kỷ niệm nhanh`
-    document.title = pageTitle
-  }, [currentUser.name])
-
-  // Persist Current User
-  useEffect(() => {
-    setPersistedCurrentUser(currentUser)
+    if (currentUser) {
+      document.title = `${currentUser.name} - Memories Tìm kỷ niệm nhanh`
+      setAuthProfileForm({ name: currentUser.name })
+      setSupabaseForm({
+        url: currentUser.supabaseConfig?.url || '',
+        anonKey: currentUser.supabaseConfig?.anonKey || '',
+        syncEnabled: currentUser.supabaseConfig?.syncEnabled || false
+      })
+    } else {
+      document.title = 'Memories - Tìm kỷ niệm nhanh (Đăng nhập)'
+    }
   }, [currentUser])
 
   // Load isolated data from IndexedDB upon User Change (NO default seeded images)
   useEffect(() => {
+    if (!currentUser) {
+      setMedia([])
+      setAlbums([])
+      setIsLoaded(false)
+      return
+    }
+
     let isMounted = true
     async function loadData() {
+      if (!currentUser) return
       setIsLoaded(false)
       const userMedia = await getAllMediaFromDB(currentUser.id)
       const userAlbums = await getAllAlbumsFromDB(currentUser.id)
@@ -271,20 +288,20 @@ function App() {
     return () => {
       isMounted = false
     }
-  }, [currentUser.id])
+  }, [currentUser?.id])
 
   // Save changes to isolated database
   useEffect(() => {
-    if (isLoaded) {
+    if (isLoaded && currentUser) {
       saveAllMediaToDB(media, currentUser.id)
     }
-  }, [media, isLoaded, currentUser.id])
+  }, [media, isLoaded, currentUser?.id])
 
   useEffect(() => {
-    if (isLoaded) {
+    if (isLoaded && currentUser) {
       saveAllAlbumsToDB(albums, currentUser.id)
     }
-  }, [albums, isLoaded, currentUser.id])
+  }, [albums, isLoaded, currentUser?.id])
 
   // Auto slideshow runner
   useEffect(() => {
@@ -384,35 +401,42 @@ function App() {
   }, [media, activeTab, selectedTag, selectedYear, selectedAlbumId, query, aiSearchInput])
 
   // Authentication Handlers
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault()
+  const handleLogin = (e?: React.FormEvent, accountToDirectLogin?: UserAccount) => {
+    if (e) e.preventDefault()
     setAuthError('')
     setAuthSuccess('')
-    const email = authLoginForm.email.trim().toLowerCase()
-    const password = authLoginForm.password.trim()
 
-    if (!email || !password) {
-      setAuthError('Vui lòng nhập đầy đủ Email và Mật khẩu.')
-      return
+    let targetAccount = accountToDirectLogin
+
+    if (!targetAccount) {
+      const email = authLoginForm.email.trim().toLowerCase()
+      const password = authLoginForm.password.trim()
+
+      if (!email || !password) {
+        setAuthError('Vui lòng nhập đầy đủ Email và Mật khẩu.')
+        return
+      }
+
+      const accounts = getAllRegisteredAccounts()
+      const found = accounts.find(a => a.email.toLowerCase() === email)
+
+      if (!found) {
+        setAuthError('Tài khoản không tồn tại trên thiết bị này. Vui lòng kiểm tra lại hoặc Đăng ký tài khoản mới.')
+        return
+      }
+
+      if (found.passwordHash !== password) {
+        setAuthError('Mật khẩu không chính xác.')
+        return
+      }
+      targetAccount = found
     }
 
-    const accounts = getAllRegisteredAccounts()
-    const found = accounts.find(a => a.email.toLowerCase() === email)
-
-    if (!found) {
-      setAuthError('Tài khoản không tồn tại. Vui lòng kiểm tra lại hoặc Đăng ký tài khoản mới.')
-      return
-    }
-
-    if (found.passwordHash !== password) {
-      setAuthError('Mật khẩu không chính xác.')
-      return
-    }
-
-    setCurrentUser(found)
+    setPersistedCurrentUser(targetAccount, rememberDeviceOption)
+    setCurrentUser(targetAccount)
     setAuthLoginForm({ email: '', password: '' })
     setShowAuthModal(false)
-    showToast(`Đăng nhập thành công! Chào mừng ${found.name}.`)
+    showToast(`Đăng nhập thành công! Chào mừng ${targetAccount.name}.`)
   }
 
   const handleRegister = (e: React.FormEvent) => {
@@ -447,7 +471,7 @@ function App() {
 
     const accounts = getAllRegisteredAccounts()
     if (accounts.some(a => a.email.toLowerCase() === email)) {
-      setAuthError('Email này đã được đăng ký. Vui lòng đăng nhập.')
+      setAuthError('Email này đã được đăng ký trên thiết bị này. Vui lòng đăng nhập.')
       return
     }
 
@@ -461,6 +485,7 @@ function App() {
 
     const updated = [...accounts, newAccount]
     saveAllRegisteredAccounts(updated)
+    setPersistedCurrentUser(newAccount, rememberDeviceOption)
     setCurrentUser(newAccount)
     setAuthRegisterForm({ name: '', email: '', password: '', confirmPassword: '' })
     setShowAuthModal(false)
@@ -469,6 +494,7 @@ function App() {
 
   const handleChangePassword = (e: React.FormEvent) => {
     e.preventDefault()
+    if (!currentUser) return
     setAuthError('')
     setAuthSuccess('')
 
@@ -504,6 +530,7 @@ function App() {
 
     saveAllRegisteredAccounts(updatedAccounts)
     const updatedUser = { ...currentUser, passwordHash: newPassword }
+    setPersistedCurrentUser(updatedUser, rememberDeviceOption)
     setCurrentUser(updatedUser)
     setAuthPasswordForm({ oldPassword: '', newPassword: '', confirmPassword: '' })
     setAuthSuccess('Đổi mật khẩu thành công!')
@@ -512,7 +539,7 @@ function App() {
 
   const handleUpdateProfile = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!authProfileForm.name.trim()) return
+    if (!currentUser || !authProfileForm.name.trim()) return
 
     const accounts = getAllRegisteredAccounts()
     const updatedAccounts = accounts.map(a => {
@@ -524,16 +551,22 @@ function App() {
 
     saveAllRegisteredAccounts(updatedAccounts)
     const updatedUser = { ...currentUser, name: authProfileForm.name.trim() }
+    setPersistedCurrentUser(updatedUser, rememberDeviceOption)
     setCurrentUser(updatedUser)
     setShowAuthModal(false)
     showToast('Đã cập nhật tên hiển thị thành công!')
   }
 
   const handleLogout = () => {
-    // Switch or prompt login
-    setShowAuthModal(true)
-    setAuthModalTab('login')
-    showToast('Đã đăng xuất tài khoản. Hãy đăng nhập để tiếp tục.')
+    setPersistedCurrentUser(null)
+    setCurrentUser(null)
+    setMedia([])
+    setAlbums([])
+    setIsLoaded(false)
+    setShowAuthModal(false)
+    setAuthError('')
+    setAuthSuccess('')
+    showToast('Đã đăng xuất tài khoản thành công! Phiên làm việc trên thiết bị này đã kết thúc.')
   }
 
   // Handle URL Validation & Testing
@@ -730,6 +763,7 @@ function App() {
 
   // Save new memory
   const handleSaveMemory = async () => {
+    if (!currentUser) return
     const finalItems: MediaItem[] = []
     const now = new Date().toISOString()
     const rawTags = urlForm.tags.split(/[,#]/).map(t => t.trim()).filter(Boolean)
@@ -870,6 +904,7 @@ function App() {
   // Delete Memory
   const handleDeleteMemory = (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation()
+    if (!currentUser) return
     if (window.confirm('Bạn có chắc chắn muốn xóa bức ảnh kỷ niệm này?')) {
       deleteMediaItemFromDB(id, currentUser.id)
       setMedia(prev => prev.filter(m => m.id !== id))
@@ -896,7 +931,7 @@ function App() {
   // Create Album
   const handleSaveAlbum = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!albumForm.name.trim()) return
+    if (!currentUser || !albumForm.name.trim()) return
 
     if (editingAlbum) {
       setAlbums(prev =>
@@ -927,6 +962,7 @@ function App() {
   // Delete Album
   const handleDeleteAlbum = (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation()
+    if (!currentUser) return
     if (window.confirm('Bạn có chắc muốn xóa album này? (Các bức ảnh bên trong vẫn sẽ được giữ lại)')) {
       deleteAlbumFromDB(id, currentUser.id)
       setAlbums(prev => prev.filter(a => a.id !== id))
@@ -970,6 +1006,7 @@ function App() {
 
   // Export JSON Backup for Account
   const handleExportBackup = () => {
+    if (!currentUser) return
     const data = {
       version: 2,
       export_date: new Date().toISOString(),
@@ -996,9 +1033,11 @@ function App() {
 
   // Import JSON Backup for Account
   const handleImportBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!currentUser) return
     const file = e.target.files?.[0]
     if (!file) return
 
+    const activeUserId = currentUser.id
     const reader = new FileReader()
     reader.onload = async (evt) => {
       try {
@@ -1007,17 +1046,17 @@ function App() {
         if (parsed.memories && Array.isArray(parsed.memories)) {
           const importedMedia: MediaItem[] = parsed.memories.map((m: any) => ({
             ...m,
-            user_id: currentUser.id
+            user_id: activeUserId
           }))
           const importedAlbums: AlbumItem[] = (parsed.albums || []).map((a: any) => ({
             ...a,
-            user_id: currentUser.id
+            user_id: activeUserId
           }))
 
           setMedia(importedMedia)
           setAlbums(importedAlbums)
-          await saveAllMediaToDB(importedMedia, currentUser.id)
-          await saveAllAlbumsToDB(importedAlbums, currentUser.id)
+          await saveAllMediaToDB(importedMedia, activeUserId)
+          await saveAllAlbumsToDB(importedAlbums, activeUserId)
           showToast(`Đã khôi phục thành công ${importedMedia.length} ảnh và ${importedAlbums.length} album!`)
         } else {
           alert('Tệp sao lưu không đúng định dạng My Memories!')
@@ -1031,6 +1070,7 @@ function App() {
 
   // Clear Account Data
   const handleClearAccountData = async () => {
+    if (!currentUser) return
     if (window.confirm(`Bạn có chắc chắn muốn xóa TOÀN BỘ dữ liệu ảnh và album của tài khoản ${currentUser.name}? Thao tác này không thể hoàn tác.`)) {
       await clearAccountDatabase(currentUser.id)
       setMedia([])
@@ -1041,6 +1081,7 @@ function App() {
 
   // Supabase Testing & Sync Handlers
   const handleTestSupabase = async () => {
+    if (!currentUser) return
     setSupabaseTesting(true)
     setSupabaseStatus({ text: 'Đang kiểm tra kết nối tới Supabase...', type: '' })
     const result = await testSupabaseConnection(supabaseForm.url, supabaseForm.anonKey)
@@ -1048,7 +1089,7 @@ function App() {
     if (result.success) {
       setSupabaseStatus({ text: result.message, type: 'success' })
       // Save configuration to current account
-      const updatedUser = {
+      const updatedUser: UserAccount = {
         ...currentUser,
         supabaseConfig: {
           url: supabaseForm.url,
@@ -1066,6 +1107,7 @@ function App() {
   }
 
   const handleSyncToSupabase = async () => {
+    if (!currentUser) return
     if (!supabaseForm.url || !supabaseForm.anonKey) {
       alert('Vui lòng nhập Supabase Project URL và Anon Key trước khi đồng bộ!')
       return
@@ -1113,10 +1155,12 @@ function App() {
   }
 
   const handlePullFromSupabase = async () => {
+    if (!currentUser) return
     if (!supabaseForm.url || !supabaseForm.anonKey) {
       alert('Vui lòng nhập Supabase Project URL và Anon Key!')
       return
     }
+    const activeUserId = currentUser.id
     setSupabaseSyncing(true)
     try {
       const client = createSupabaseInstance(supabaseForm.url, supabaseForm.anonKey)
@@ -1125,23 +1169,23 @@ function App() {
       const { data: remoteMedia, error: mErr } = await client
         .from('memories')
         .select('*')
-        .eq('user_id', currentUser.id)
+        .eq('user_id', activeUserId)
 
       const { data: remoteAlbums, error: aErr } = await client
         .from('albums')
         .select('*')
-        .eq('user_id', currentUser.id)
+        .eq('user_id', activeUserId)
 
       if (mErr) throw mErr
       if (aErr) throw aErr
 
       if (remoteMedia) {
         setMedia(remoteMedia)
-        await saveAllMediaToDB(remoteMedia, currentUser.id)
+        await saveAllMediaToDB(remoteMedia, activeUserId)
       }
       if (remoteAlbums) {
         setAlbums(remoteAlbums)
-        await saveAllAlbumsToDB(remoteAlbums, currentUser.id)
+        await saveAllAlbumsToDB(remoteAlbums, activeUserId)
       }
 
       showToast(`Đã tải về ${(remoteMedia || []).length} ảnh từ Supabase!`)
@@ -1152,6 +1196,294 @@ function App() {
     }
   }
 
+  // =========================================================================
+  // RENDER AUTH PORTAL (When no user is logged in on this device/browser)
+  // =========================================================================
+  if (!currentUser) {
+    const localAccounts = getAllRegisteredAccounts()
+
+    return (
+      <div className="auth-portal-screen">
+        <div className="auth-portal-container">
+          {/* Left Brand Showcase */}
+          <div className="auth-portal-sidebar">
+            <div>
+              <div className="auth-portal-brand">
+                <div className="brand-mark" style={{ background: 'rgba(255,255,255,0.12)', color: '#e5be8a' }}>
+                  <Sparkles size={22} />
+                </div>
+                <h1>MEMORIES</h1>
+              </div>
+              <p className="auth-portal-tagline">
+                Không gian lưu giữ khoảnh khắc & tìm kiếm kỷ niệm thông minh, an toàn và riêng tư.
+              </p>
+
+              <div className="auth-features-list">
+                <div className="auth-feature-item">
+                  <div className="auth-feature-icon">
+                    <UserCheck size={16} />
+                  </div>
+                  <div>
+                    <strong>Độc lập trên từng thiết bị & IP</strong>
+                    <p>Phiên làm việc riêng biệt cho từng máy, không bị tự động chia sẻ hay can thiệp.</p>
+                  </div>
+                </div>
+
+                <div className="auth-feature-item">
+                  <div className="auth-feature-icon">
+                    <Database size={16} />
+                  </div>
+                  <div>
+                    <strong>Database riêng biệt theo tài khoản</strong>
+                    <p>Mỗi tài khoản lưu trữ trên phân vùng cơ sở dữ liệu IndexedDB riêng không trùng lặp.</p>
+                  </div>
+                </div>
+
+                <div className="auth-feature-item">
+                  <div className="auth-feature-icon">
+                    <Camera size={16} />
+                  </div>
+                  <div>
+                    <strong>Trích xuất thông số ảnh EXIF</strong>
+                    <p>Tự động nhận diện ngày chụp, địa điểm GPS và dòng máy ảnh khi tải ảnh từ máy hoặc URL.</p>
+                  </div>
+                </div>
+
+                <div className="auth-feature-item">
+                  <div className="auth-feature-icon">
+                    <Upload size={16} />
+                  </div>
+                  <div>
+                    <strong>Hỗ trợ kết nối Supabase Cloud</strong>
+                    <p>Đồng bộ dữ liệu đa thiết bị an toàn khi người dùng cấu hình.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="auth-device-note">
+              🔒 <strong>Bảo mật thiết bị:</strong> Bạn đang truy cập trên thiết bị này. Đăng nhập để mở không gian kỷ niệm cá nhân của bạn.
+            </div>
+          </div>
+
+          {/* Right Auth Action Panel */}
+          <div className="auth-portal-main">
+            {/* Tab Pill Switcher */}
+            <div className="auth-portal-tabs">
+              <button
+                className={`auth-portal-tab ${authPortalTab === 'login' ? 'active' : ''}`}
+                onClick={() => {
+                  setAuthPortalTab('login')
+                  setAuthError('')
+                  setAuthSuccess('')
+                }}
+              >
+                <UserCheck size={16} />
+                <span>Đăng nhập</span>
+              </button>
+              <button
+                className={`auth-portal-tab ${authPortalTab === 'register' ? 'active' : ''}`}
+                onClick={() => {
+                  setAuthPortalTab('register')
+                  setAuthError('')
+                  setAuthSuccess('')
+                }}
+              >
+                <UserPlus size={16} />
+                <span>Đăng ký mới</span>
+              </button>
+            </div>
+
+            {/* Quick account selection if accounts exist on this device */}
+            {localAccounts.length > 0 && authPortalTab === 'login' && (
+              <div className="auth-quick-accounts-box">
+                <div className="auth-quick-accounts-title">
+                  <Check size={14} color="#7c6f5e" />
+                  <span>Tài khoản sẵn có trên thiết bị này:</span>
+                </div>
+                <div className="auth-quick-account-chips">
+                  {localAccounts.map(acc => (
+                    <div
+                      key={acc.id}
+                      className="auth-account-chip"
+                      onClick={() => {
+                        setAuthLoginForm({ email: acc.email, password: acc.passwordHash || '123456' })
+                        handleLogin(undefined, acc)
+                      }}
+                      title={`Đăng nhập nhanh với tài khoản ${acc.name}`}
+                    >
+                      <div className="auth-account-chip-avatar">
+                        {acc.name.charAt(0).toUpperCase()}
+                      </div>
+                      <span>{acc.name} ({acc.email})</span>
+                      <ChevronRight size={13} color="#999" />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {authError && <div className="alert-box alert-error">{authError}</div>}
+            {authSuccess && <div className="alert-box alert-success">{authSuccess}</div>}
+
+            {/* LOGIN FORM */}
+            {authPortalTab === 'login' && (
+              <form className="modal-form" onSubmit={(e) => handleLogin(e)}>
+                <label>
+                  Địa chỉ Email:
+                  <input
+                    type="email"
+                    placeholder="email@example.com"
+                    value={authLoginForm.email}
+                    onChange={e => setAuthLoginForm(prev => ({ ...prev, email: e.target.value }))}
+                    required
+                    autoFocus
+                  />
+                </label>
+                <label>
+                  Mật khẩu:
+                  <input
+                    type="password"
+                    placeholder="••••••••"
+                    value={authLoginForm.password}
+                    onChange={e => setAuthLoginForm(prev => ({ ...prev, password: e.target.value }))}
+                    required
+                  />
+                </label>
+
+                <div style={{ margin: '6px 0 14px' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: '#555' }}>
+                    <input
+                      type="checkbox"
+                      checked={rememberDeviceOption}
+                      onChange={e => setRememberDeviceOption(e.target.checked)}
+                      style={{ width: 'auto', margin: 0 }}
+                    />
+                    <span>Ghi nhớ đăng nhập trên thiết bị này</span>
+                  </label>
+                </div>
+
+                <button className="primary full" type="submit" style={{ marginTop: 4 }}>
+                  <UserCheck size={16} />
+                  <span>Đăng nhập vào Memories</span>
+                </button>
+
+                <div style={{ marginTop: 16, fontSize: 12.5, color: '#777', textAlign: 'center' }}>
+                  Chưa có tài khoản?{' '}
+                  <button
+                    type="button"
+                    className="text-button"
+                    style={{ position: 'static', padding: 0, fontWeight: 600 }}
+                    onClick={() => {
+                      setAuthPortalTab('register')
+                      setAuthError('')
+                      setAuthSuccess('')
+                    }}
+                  >
+                    Đăng ký tài khoản mới ngay
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* REGISTER FORM */}
+            {authPortalTab === 'register' && (
+              <form className="modal-form" onSubmit={handleRegister}>
+                <label>
+                  Tên của bạn (Hiển thị trên tiêu đề Memories):
+                  <input
+                    type="text"
+                    placeholder="VD: Thanh Yến, Tuấn Anh..."
+                    value={authRegisterForm.name}
+                    onChange={e => setAuthRegisterForm(prev => ({ ...prev, name: e.target.value }))}
+                    required
+                    autoFocus
+                  />
+                </label>
+                <label>
+                  Địa chỉ Email (Dùng để đăng nhập):
+                  <input
+                    type="email"
+                    placeholder="email@example.com"
+                    value={authRegisterForm.email}
+                    onChange={e => setAuthRegisterForm(prev => ({ ...prev, email: e.target.value }))}
+                    required
+                  />
+                </label>
+                <div className="form-row">
+                  <label>
+                    Mật khẩu:
+                    <input
+                      type="password"
+                      placeholder="Ít nhất 6 ký tự"
+                      value={authRegisterForm.password}
+                      onChange={e => setAuthRegisterForm(prev => ({ ...prev, password: e.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Xác nhận mật khẩu:
+                    <input
+                      type="password"
+                      placeholder="Nhập lại mật khẩu"
+                      value={authRegisterForm.confirmPassword}
+                      onChange={e => setAuthRegisterForm(prev => ({ ...prev, confirmPassword: e.target.value }))}
+                      required
+                    />
+                  </label>
+                </div>
+
+                <div style={{ margin: '6px 0 14px' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: '#555' }}>
+                    <input
+                      type="checkbox"
+                      checked={rememberDeviceOption}
+                      onChange={e => setRememberDeviceOption(e.target.checked)}
+                      style={{ width: 'auto', margin: 0 }}
+                    />
+                    <span>Ghi nhớ đăng nhập trên thiết bị này</span>
+                  </label>
+                </div>
+
+                <button className="primary full" type="submit" style={{ marginTop: 4 }}>
+                  <UserPlus size={16} />
+                  <span>Tạo tài khoản & Mở database riêng</span>
+                </button>
+
+                <div style={{ marginTop: 16, fontSize: 12.5, color: '#777', textAlign: 'center' }}>
+                  Đã có tài khoản?{' '}
+                  <button
+                    type="button"
+                    className="text-button"
+                    style={{ position: 'static', padding: 0, fontWeight: 600 }}
+                    onClick={() => {
+                      setAuthPortalTab('login')
+                      setAuthError('')
+                      setAuthSuccess('')
+                    }}
+                  >
+                    Đăng nhập ngay
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+
+        {/* Toast Notification in Portal */}
+        {notice && (
+          <div className="toast" onClick={() => setNotice('')}>
+            <span>{notice}</span>
+            <X size={14} />
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // =========================================================================
+  // MAIN AUTHENTICATED APP SHELL
+  // =========================================================================
   return (
     <div className="app-shell">
       {/* Mobile Overlay */}
@@ -1259,7 +1591,7 @@ function App() {
               className="secondary"
               onClick={() => {
                 setShowAuthModal(true)
-                setAuthModalTab('login')
+                setAuthModalTab('switch_account')
               }}
               title="Đổi tài khoản khác"
             >
@@ -2064,7 +2396,7 @@ function App() {
                     className="secondary"
                     onClick={() => {
                       setShowAuthModal(true)
-                      setAuthModalTab('login')
+                      setAuthModalTab('switch_account')
                     }}
                   >
                     <UserPlus size={15} />
@@ -2782,18 +3114,16 @@ function App() {
             {/* Auth Tab Switcher */}
             <div className="tab-pill-switcher">
               <button
-                className={authModalTab === 'login' ? 'active' : ''}
-                onClick={() => { setAuthModalTab('login'); setAuthError(''); setAuthSuccess(''); }}
+                className={authModalTab === 'profile' ? 'active' : ''}
+                onClick={() => {
+                  setAuthModalTab('profile')
+                  setAuthProfileForm({ name: currentUser?.name || '' })
+                  setAuthError('')
+                  setAuthSuccess('')
+                }}
               >
-                <UserCheck size={14} />
-                <span>Đăng nhập</span>
-              </button>
-              <button
-                className={authModalTab === 'register' ? 'active' : ''}
-                onClick={() => { setAuthModalTab('register'); setAuthError(''); setAuthSuccess(''); }}
-              >
-                <UserPlus size={14} />
-                <span>Đăng ký mới</span>
+                <Edit2 size={14} />
+                <span>Tên hiển thị</span>
               </button>
               <button
                 className={authModalTab === 'change_password' ? 'active' : ''}
@@ -2803,114 +3133,36 @@ function App() {
                 <span>Đổi mật khẩu</span>
               </button>
               <button
-                className={authModalTab === 'profile' ? 'active' : ''}
-                onClick={() => {
-                  setAuthModalTab('profile')
-                  setAuthProfileForm({ name: currentUser.name })
-                  setAuthError('')
-                  setAuthSuccess('')
-                }}
+                className={authModalTab === 'switch_account' ? 'active' : ''}
+                onClick={() => { setAuthModalTab('switch_account'); setAuthError(''); setAuthSuccess(''); }}
               >
-                <Edit2 size={14} />
-                <span>Tên hiển thị</span>
+                <UserCheck size={14} />
+                <span>Đổi tài khoản</span>
               </button>
             </div>
 
             {authError && <div className="alert-box alert-error">{authError}</div>}
             {authSuccess && <div className="alert-box alert-success">{authSuccess}</div>}
 
-            {/* LOGIN FORM */}
-            {authModalTab === 'login' && (
-              <form className="modal-form" onSubmit={handleLogin}>
+            {/* PROFILE EDIT FORM */}
+            {authModalTab === 'profile' && (
+              <form className="modal-form" onSubmit={handleUpdateProfile}>
                 <label>
-                  Địa chỉ Email:
-                  <input
-                    type="email"
-                    placeholder="email@example.com"
-                    value={authLoginForm.email}
-                    onChange={e => setAuthLoginForm(prev => ({ ...prev, email: e.target.value }))}
-                    required
-                  />
-                </label>
-                <label>
-                  Mật khẩu:
-                  <input
-                    type="password"
-                    placeholder="••••••••"
-                    value={authLoginForm.password}
-                    onChange={e => setAuthLoginForm(prev => ({ ...prev, password: e.target.value }))}
-                    required
-                  />
-                </label>
-
-                <button className="primary full" type="submit" style={{ marginTop: 10 }}>
-                  <UserCheck size={16} />
-                  <span>Đăng nhập vào không gian của bạn</span>
-                </button>
-
-                <div style={{ marginTop: 12, fontSize: 12, color: '#888', textAlign: 'center' }}>
-                  Chưa có tài khoản?{' '}
-                  <button
-                    type="button"
-                    className="text-button"
-                    style={{ position: 'static', padding: 0 }}
-                    onClick={() => setAuthModalTab('register')}
-                  >
-                    Đăng ký ngay
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {/* REGISTER FORM */}
-            {authModalTab === 'register' && (
-              <form className="modal-form" onSubmit={handleRegister}>
-                <label>
-                  Tên của bạn (Hiển thị trên tiêu đề Memories):
+                  Tên hiển thị:
                   <input
                     type="text"
-                    placeholder="VD: Thanh Yến, Tuấn Anh..."
-                    value={authRegisterForm.name}
-                    onChange={e => setAuthRegisterForm(prev => ({ ...prev, name: e.target.value }))}
+                    value={authProfileForm.name}
+                    onChange={e => setAuthProfileForm({ name: e.target.value })}
                     required
                   />
                 </label>
-                <label>
-                  Địa chỉ Email (Dùng để đăng nhập):
-                  <input
-                    type="email"
-                    placeholder="email@example.com"
-                    value={authRegisterForm.email}
-                    onChange={e => setAuthRegisterForm(prev => ({ ...prev, email: e.target.value }))}
-                    required
-                  />
-                </label>
-                <div className="form-row">
-                  <label>
-                    Mật khẩu:
-                    <input
-                      type="password"
-                      placeholder="Ít nhất 6 ký tự"
-                      value={authRegisterForm.password}
-                      onChange={e => setAuthRegisterForm(prev => ({ ...prev, password: e.target.value }))}
-                      required
-                    />
-                  </label>
-                  <label>
-                    Xác nhận mật khẩu:
-                    <input
-                      type="password"
-                      placeholder="Nhập lại mật khẩu"
-                      value={authRegisterForm.confirmPassword}
-                      onChange={e => setAuthRegisterForm(prev => ({ ...prev, confirmPassword: e.target.value }))}
-                      required
-                    />
-                  </label>
-                </div>
+                <p style={{ fontSize: 12, color: '#777' }}>
+                  Tiêu đề trang web sẽ tự động đổi thành: <strong>{authProfileForm.name || '...'} - Memories Tìm kỷ niệm nhanh</strong>
+                </p>
 
                 <button className="primary full" type="submit" style={{ marginTop: 10 }}>
-                  <UserPlus size={16} />
-                  <span>Tạo tài khoản & Mở database riêng</span>
+                  <Check size={16} />
+                  <span>Lưu thay đổi tên</span>
                 </button>
               </form>
             )}
@@ -2956,27 +3208,75 @@ function App() {
               </form>
             )}
 
-            {/* PROFILE EDIT FORM */}
-            {authModalTab === 'profile' && (
-              <form className="modal-form" onSubmit={handleUpdateProfile}>
-                <label>
-                  Tên hiển thị:
-                  <input
-                    type="text"
-                    value={authProfileForm.name}
-                    onChange={e => setAuthProfileForm({ name: e.target.value })}
-                    required
-                  />
-                </label>
-                <p style={{ fontSize: 12, color: '#777' }}>
-                  Tiêu đề trang web sẽ tự động đổi thành: <strong>{authProfileForm.name || '...'} - Memories Tìm kỷ niệm nhanh</strong>
-                </p>
+            {/* SWITCH ACCOUNT / LOGIN FORM */}
+            {authModalTab === 'switch_account' && (
+              <div>
+                <div style={{ marginBottom: 14 }}>
+                  <p style={{ fontSize: 13, color: '#666', marginBottom: 8 }}>
+                    Chọn tài khoản khác trên thiết bị này hoặc đăng nhập tài khoản mới:
+                  </p>
+                  <div className="auth-quick-account-chips">
+                    {getAllRegisteredAccounts().map(acc => (
+                      <div
+                        key={acc.id}
+                        className={`auth-account-chip ${acc.id === currentUser?.id ? 'active' : ''}`}
+                        onClick={() => {
+                          if (acc.id !== currentUser?.id) {
+                            handleLogin(undefined, acc)
+                          }
+                        }}
+                        style={acc.id === currentUser?.id ? { borderColor: '#b27a3c', background: '#fcf6ec' } : {}}
+                      >
+                        <div className="auth-account-chip-avatar">
+                          {acc.name.charAt(0).toUpperCase()}
+                        </div>
+                        <span>{acc.name} ({acc.email}) {acc.id === currentUser?.id ? '★ Đang dùng' : ''}</span>
+                        {acc.id !== currentUser?.id && <ChevronRight size={13} color="#999" />}
+                      </div>
+                    ))}
+                  </div>
+                </div>
 
-                <button className="primary full" type="submit" style={{ marginTop: 10 }}>
-                  <Check size={16} />
-                  <span>Lưu thay đổi</span>
-                </button>
-              </form>
+                <form className="modal-form" onSubmit={(e) => handleLogin(e)}>
+                  <label>
+                    Địa chỉ Email khác:
+                    <input
+                      type="email"
+                      placeholder="email@example.com"
+                      value={authLoginForm.email}
+                      onChange={e => setAuthLoginForm(prev => ({ ...prev, email: e.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Mật khẩu:
+                    <input
+                      type="password"
+                      placeholder="••••••••"
+                      value={authLoginForm.password}
+                      onChange={e => setAuthLoginForm(prev => ({ ...prev, password: e.target.value }))}
+                      required
+                    />
+                  </label>
+
+                  <button className="primary full" type="submit" style={{ marginTop: 10 }}>
+                    <UserCheck size={16} />
+                    <span>Đăng nhập & chuyển tài khoản</span>
+                  </button>
+
+                  <div style={{ marginTop: 12, textAlign: 'center' }}>
+                    <button
+                      type="button"
+                      className="secondary full delete-btn"
+                      onClick={handleLogout}
+                      style={{ marginTop: 8 }}
+                    >
+                      <LogOut size={15} />
+                      <span>Đăng xuất khỏi thiết bị này</span>
+                    </button>
+                  </div>
+                </form>
+              </div>
             )}
           </div>
         </div>
