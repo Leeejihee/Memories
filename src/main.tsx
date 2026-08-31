@@ -56,17 +56,19 @@ import {
   getAllRegisteredAccounts,
   getPersistedCurrentUser,
   getSafeProxyImageUrl,
+  isGooglePhotosWebPage,
   normalizeImageUrl,
   saveAllAlbumsToDB,
   saveAllMediaToDB,
   saveAllRegisteredAccounts,
   saveMediaItemToDB,
   setPersistedCurrentUser,
-  testSupabaseConnection
+  testSupabaseConnection,
+  tryResolveGooglePhotosDirectLink
 } from './db'
 import './styles.css'
 
-// Robust SmartImage component with automatic no-referrer, proxy fallback for CORS/hotlink protection, and broken image recovery
+// Robust SmartImage component with automatic no-referrer, multi-proxy fallbacks for CORS/hotlink protection, and Google Photos auto-resolution
 function SmartImage({
   src,
   alt = 'Memory',
@@ -89,20 +91,46 @@ function SmartImage({
   const [currentSrc, setCurrentSrc] = useState<string>(() => normalizeImageUrl(src || ''))
   const [fallbackAttempt, setFallbackAttempt] = useState<number>(0)
   const [hasError, setHasError] = useState(false)
+  const [isResolvingGPhotos, setIsResolvingGPhotos] = useState(false)
 
   useEffect(() => {
-    setCurrentSrc(normalizeImageUrl(src || ''))
+    let active = true
+    const init = async () => {
+      const normalized = normalizeImageUrl(src || '')
+      if (isGooglePhotosWebPage(normalized)) {
+        setIsResolvingGPhotos(true)
+        const resolved = await tryResolveGooglePhotosDirectLink(normalized)
+        if (active && resolved) {
+          setCurrentSrc(resolved)
+          setIsResolvingGPhotos(false)
+          return
+        }
+        if (active) setIsResolvingGPhotos(false)
+      }
+      if (active) {
+        setCurrentSrc(normalized)
+      }
+    }
     setFallbackAttempt(0)
     setHasError(false)
+    init()
+    return () => { active = false }
   }, [src])
 
   const handleImgError = () => {
+    const rawNormalized = normalizeImageUrl(src || '')
     if (fallbackAttempt === 0 && currentSrc && !currentSrc.startsWith('data:') && !currentSrc.startsWith('blob:')) {
       setFallbackAttempt(1)
-      setCurrentSrc(`https://wsrv.nl/?url=${encodeURIComponent(normalizeImageUrl(src))}&output=webp`)
+      setCurrentSrc(`https://wsrv.nl/?url=${encodeURIComponent(rawNormalized)}&output=webp`)
     } else if (fallbackAttempt === 1 && currentSrc && !currentSrc.startsWith('data:')) {
       setFallbackAttempt(2)
-      setCurrentSrc(`https://images.weserv.nl/?url=${encodeURIComponent(normalizeImageUrl(src))}`)
+      setCurrentSrc(`https://images.weserv.nl/?url=${encodeURIComponent(rawNormalized)}`)
+    } else if (fallbackAttempt === 2 && currentSrc && !currentSrc.startsWith('data:')) {
+      setFallbackAttempt(3)
+      setCurrentSrc(`https://api.allorigins.win/raw?url=${encodeURIComponent(rawNormalized)}`)
+    } else if (fallbackAttempt === 3 && currentSrc && !currentSrc.startsWith('data:')) {
+      setFallbackAttempt(4)
+      setCurrentSrc(`https://corsproxy.io/?${encodeURIComponent(rawNormalized)}`)
     } else {
       setHasError(true)
       if (onError) onError()
@@ -110,6 +138,7 @@ function SmartImage({
   }
 
   if (hasError || !currentSrc) {
+    const isGPhotosPage = isGooglePhotosWebPage(src)
     return (
       <div
         className={`image-error-box ${className || ''}`}
@@ -132,7 +161,7 @@ function SmartImage({
         onClick={onClick as any}
       >
         <ImageIcon size={22} style={{ opacity: 0.6 }} />
-        <span>Không thể hiển thị ảnh</span>
+        <span>{isGPhotosPage ? 'Link trang Google Photos (Cần link ảnh trực tiếp)' : 'Không thể hiển thị ảnh'}</span>
       </div>
     )
   }
@@ -591,7 +620,7 @@ function App() {
   }
 
   // Handle URL Validation & Testing
-  const handleTestUrl = (rawTextOverride?: string) => {
+  const handleTestUrl = async (rawTextOverride?: string) => {
     const raw = (typeof rawTextOverride === 'string' ? rawTextOverride : urlInputText).trim()
     const firstUrl = raw.split(/[\n,;]/)[0]?.trim()
     if (!firstUrl || (!firstUrl.startsWith('http://') && !firstUrl.startsWith('https://') && !firstUrl.startsWith('data:'))) {
@@ -600,12 +629,23 @@ function App() {
       return
     }
 
-    const normalized = normalizeImageUrl(firstUrl)
+    let normalized = normalizeImageUrl(firstUrl)
     setUrlPreviewStatus('loading')
+
+    // If it's a Google Photos web page URL, try resolving
+    if (isGooglePhotosWebPage(normalized)) {
+      const resolved = await tryResolveGooglePhotosDirectLink(normalized)
+      if (resolved) {
+        normalized = resolved
+        if (!raw.includes('\n') && !raw.includes(',')) {
+          setUrlInputText(resolved)
+        }
+      }
+    }
 
     // Detect Source
     let detected = 'Liên kết ảnh Web'
-    if (normalized.includes('googleusercontent.com') || normalized.includes('photos.fife')) {
+    if (normalized.includes('googleusercontent.com') || normalized.includes('photos.fife') || isGooglePhotosWebPage(firstUrl)) {
       detected = 'Google Photos'
     } else if (normalized.includes('drive.google.com')) {
       detected = 'Google Drive'
@@ -652,12 +692,35 @@ function App() {
         setUrlPreviewStatus('valid')
       }
       proxyImg.onerror = () => {
-        setUrlPreviewStatus('valid')
+        setUrlPreviewStatus(isGooglePhotosWebPage(firstUrl) ? 'error' : 'valid')
       }
       proxyImg.src = getSafeProxyImageUrl(normalized)
     }
 
     img.src = normalized
+  }
+
+  // Auto Resolve Google Photos direct link
+  const handleAutoResolveGooglePhotos = async () => {
+    const raw = urlInputText.trim()
+    if (!raw) return
+    const firstUrl = raw.split(/[\n,;]/)[0]?.trim()
+    showToast('Đang quét và giải mã link ảnh từ Google Photos...')
+    setUrlPreviewStatus('loading')
+    try {
+      const resolved = await tryResolveGooglePhotosDirectLink(firstUrl)
+      if (resolved) {
+        setUrlInputText(resolved)
+        setUrlPreviewStatus('valid')
+        showToast('🎉 Đã giải mã thành công link ảnh trực tiếp!')
+      } else {
+        setUrlPreviewStatus('error')
+        showToast('Ảnh ở chế độ riêng tư: Hãy chuột phải vào ảnh trên Google Photos > Chọn "Sao chép địa chỉ hình ảnh" và dán lại.')
+      }
+    } catch {
+      setUrlPreviewStatus('error')
+      showToast('Không thể giải mã tự động. Vui lòng copy link ảnh trực tiếp.')
+    }
   }
 
   // Debounced auto-test on urlInputText change
@@ -834,7 +897,13 @@ function App() {
 
       for (let idx = 0; idx < rawUrls.length; idx++) {
         const rawLink = rawUrls[idx]
-        const normalized = normalizeImageUrl(rawLink)
+        let normalized = normalizeImageUrl(rawLink)
+        if (isGooglePhotosWebPage(normalized)) {
+          const resolved = await tryResolveGooglePhotosDirectLink(normalized)
+          if (resolved) {
+            normalized = resolved
+          }
+        }
         let finalStorageKey = normalized
         let extractedExif: ExifInfo | null = null
 
@@ -846,7 +915,7 @@ function App() {
               finalStorageKey = fetched.dataUrl
               if (fetched.exif) extractedExif = fetched.exif
             }
-          } catch (fetchErr) {
+          } catch (fetchErr: any) {
             console.warn('Cannot convert URL to local Base64, saving direct normalized URL:', fetchErr)
             finalStorageKey = normalized
           }
@@ -2712,7 +2781,7 @@ function App() {
                   />
 
                   <div className="url-actions-bar">
-                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                       <button
                         type="button"
                         className="secondary"
@@ -2731,6 +2800,17 @@ function App() {
                         <Sparkles size={14} />
                         <span>Gợi ý thẻ & tên</span>
                       </button>
+                      {isGooglePhotosWebPage(urlInputText) && (
+                        <button
+                          type="button"
+                          className="primary"
+                          style={{ padding: '5px 10px', fontSize: 12 }}
+                          onClick={handleAutoResolveGooglePhotos}
+                        >
+                          <Sparkles size={14} />
+                          <span>⚡ Tìm link ảnh gốc</span>
+                        </button>
+                      )}
                     </div>
 
                     {urlDetectedSource && (
@@ -2740,6 +2820,36 @@ function App() {
                     )}
                   </div>
                 </div>
+
+                {/* Google Photos Dedicated Helper Banner */}
+                {isGooglePhotosWebPage(urlInputText) && (
+                  <div className="google-photos-tip-box">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, marginBottom: 4 }}>
+                      <span>📷 Mẹo hiển thị ảnh Google Photos trực tiếp:</span>
+                    </div>
+                    <div>
+                      Link bạn đang dán là trang web Google Photos. Để ảnh luôn hiển thị sắc nét & không bị chặn:
+                      <ol className="google-photos-steps">
+                        <li>Trên Google Photos, nhấp <strong>chuột phải vào ảnh</strong>.</li>
+                        <li>Chọn <strong>"Sao chép địa chỉ hình ảnh"</strong> (Copy image address).</li>
+                        <li>Dán link vừa copy (có dạng <code>https://lh3.googleusercontent.com/...</code>) vào ô trên.</li>
+                      </ol>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: 11.5, padding: '4px 10px' }}
+                          onClick={handleAutoResolveGooglePhotos}
+                        >
+                          ⚡ Thử giải mã tự động
+                        </button>
+                        <span style={{ fontSize: 11, color: '#8c6b1b' }}>
+                          Hoặc chuyển sang tab <strong>"Từ máy tính / Điện thoại"</strong> để tải ảnh về máy nhanh nhất.
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* Offline persistence toggle */}
                 <label className="checkbox-label" style={{ marginTop: 2 }}>

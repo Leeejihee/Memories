@@ -386,7 +386,7 @@ export function normalizeImageUrl(rawUrl: string): string {
 
   // 2. Google Photos direct links (photos.fife.usercontent.google.com, lh3.googleusercontent.com)
   if (url.includes('googleusercontent.com') || url.includes('photos.fife.usercontent.google.com')) {
-    // If it has no size parameter, add high res parameter for best viewing
+    // Clean trailing params and add high-res param
     if (!url.includes('=w') && !url.includes('=s') && !url.includes('?')) {
       return `${url}=w2048`
     }
@@ -424,19 +424,95 @@ export function normalizeImageUrl(rawUrl: string): string {
   return url
 }
 
+// Check if a URL is a Google Photos web page URL (rather than a direct image stream)
+export function isGooglePhotosWebPage(url: string): boolean {
+  if (!url) return false
+  const clean = url.trim().toLowerCase()
+  return (
+    (clean.includes('photos.google.com/photo/') ||
+      clean.includes('photos.google.com/share/') ||
+      clean.includes('photos.google.com/u/') ||
+      clean.includes('photos.app.goo.gl/')) &&
+    !clean.includes('googleusercontent.com')
+  )
+}
+
+// Attempt to resolve a shared Google Photos page or web link to its actual direct image stream
+export async function tryResolveGooglePhotosDirectLink(pageUrl: string): Promise<string | null> {
+  const clean = pageUrl.trim()
+  if (!clean) return null
+
+  // If already direct image link
+  if (clean.includes('googleusercontent.com') || clean.includes('photos.fife')) {
+    return normalizeImageUrl(clean)
+  }
+
+  // If it's a Google Drive link
+  const gDriveMatch = clean.match(/drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?(?:export=view&)?id=)([a-zA-Z0-9_-]+)/)
+  if (gDriveMatch && gDriveMatch[1]) {
+    return `https://lh3.googleusercontent.com/d/${gDriveMatch[1]}=w2048`
+  }
+
+  // Try extracting from HTML of shared album or photo page via proxies
+  const proxies = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(clean)}`,
+    `https://corsproxy.io/?${encodeURIComponent(clean)}`
+  ]
+
+  for (const proxyUrl of proxies) {
+    try {
+      const res = await fetch(proxyUrl, { referrerPolicy: 'no-referrer' })
+      if (!res.ok) continue
+      const html = await res.text()
+
+      // Look for og:image meta tag
+      const ogMatch = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i) ||
+                      html.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:image["']/i) ||
+                      html.match(/<meta\s+itemprop=["']image["']\s+content=["']([^"']+)["']/i)
+
+      if (ogMatch && ogMatch[1] && ogMatch[1].startsWith('http')) {
+        let extracted = ogMatch[1]
+        if (extracted.includes('googleusercontent.com')) {
+          extracted = extracted.replace(/=w\d+-h\d+.*$/, '=w2048').replace(/=s\d+.*$/, '=w2048')
+          if (!extracted.includes('=w') && !extracted.includes('=s')) {
+            extracted = `${extracted}=w2048`
+          }
+        }
+        return extracted
+      }
+
+      // Look for lh3.googleusercontent.com or photos.fife pattern in page JSON
+      const lh3Match = html.match(/https:\/\/(?:lh3\.googleusercontent\.com\/[a-zA-Z0-9_-]{20,}|photos\.fife\.usercontent\.google\.com\/[a-zA-Z0-9_-]{20,})/i)
+      if (lh3Match && lh3Match[0]) {
+        return `${lh3Match[0]}=w2048`
+      }
+    } catch {
+      // Continue to next proxy
+    }
+  }
+
+  return null
+}
+
 // Safe CORS Proxy Image Generator for anti-hotlink servers
 export function getSafeProxyImageUrl(url: string): string {
   const normalized = normalizeImageUrl(url)
   if (!normalized || normalized.startsWith('data:') || normalized.startsWith('blob:')) {
     return normalized
   }
-  // Use high-performance wsrv.nl proxy as transparent fallback
-  return `https://wsrv.nl/?url=${encodeURIComponent(normalized)}&default=${encodeURIComponent(normalized)}`
+  return `https://wsrv.nl/?url=${encodeURIComponent(normalized)}&output=webp`
 }
 
-// Convert URL Image to Base64 (Local Offline Persistence)
+// Convert URL Image to Base64 (Local Offline Persistence) with multi-proxy fallbacks
 export async function fetchImageAsBase64(imageUrl: string): Promise<{ dataUrl: string; exif?: ExifInfo | null }> {
-  const normalized = normalizeImageUrl(imageUrl)
+  // First attempt auto-resolving Google Photos direct link if it's a page link
+  let normalized = normalizeImageUrl(imageUrl)
+  if (isGooglePhotosWebPage(normalized)) {
+    const resolved = await tryResolveGooglePhotosDirectLink(normalized)
+    if (resolved) {
+      normalized = resolved
+    }
+  }
 
   // Try direct fetch first
   const tryFetch = async (targetUrl: string): Promise<Blob> => {
@@ -446,27 +522,54 @@ export async function fetchImageAsBase64(imageUrl: string): Promise<{ dataUrl: s
       referrerPolicy: 'no-referrer'
     })
     if (!res.ok) throw new Error(`HTTP error ${res.status}`)
+    const contentType = res.headers.get('content-type') || ''
+    // Check if the response is actually an HTML page instead of an image
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      throw new Error('Đường link trả về trang web HTML, không phải tệp ảnh trực tiếp.')
+    }
     return await res.blob()
   }
 
   let blob: Blob | null = null
 
+  // Fallback 1: Direct fetch
   try {
     blob = await tryFetch(normalized)
   } catch {
-    // If direct fetch fails due to CORS, use proxy
+    // Fallback 2: wsrv.nl proxy
     try {
       const proxyUrl = `https://wsrv.nl/?url=${encodeURIComponent(normalized)}&output=webp`
       blob = await tryFetch(proxyUrl)
     } catch {
-      // Secondary fallback
-      const proxyUrl2 = `https://api.allorigins.win/raw?url=${encodeURIComponent(normalized)}`
-      blob = await tryFetch(proxyUrl2)
+      // Fallback 3: images.weserv.nl proxy
+      try {
+        const proxyUrl2 = `https://images.weserv.nl/?url=${encodeURIComponent(normalized)}`
+        blob = await tryFetch(proxyUrl2)
+      } catch {
+        // Fallback 4: allorigins raw proxy
+        try {
+          const proxyUrl3 = `https://api.allorigins.win/raw?url=${encodeURIComponent(normalized)}`
+          blob = await tryFetch(proxyUrl3)
+        } catch {
+          // Fallback 5: corsproxy.io
+          try {
+            const proxyUrl4 = `https://corsproxy.io/?${encodeURIComponent(normalized)}`
+            blob = await tryFetch(proxyUrl4)
+          } catch (e: any) {
+            console.error('All fetch attempts failed:', e)
+          }
+        }
+      }
     }
   }
 
   if (!blob) {
-    throw new Error('Không thể tải dữ liệu ảnh từ URL này')
+    if (isGooglePhotosWebPage(imageUrl)) {
+      throw new Error(
+        'Không thể tải ảnh từ link trang Google Photos. Hãy nhấp chuột phải vào bức ảnh trên Google Photos > Chọn "Sao chép địa chỉ hình ảnh" (Copy image address) và dán lại link bắt đầu bằng https://lh3.googleusercontent.com/...'
+      )
+    }
+    throw new Error('Không thể tải dữ liệu ảnh từ URL này. Vui lòng kiểm tra lại liên kết hoặc tải ảnh trực tiếp từ máy.')
   }
 
   // Extract EXIF if present
