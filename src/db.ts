@@ -374,6 +374,26 @@ export function normalizeImageUrl(rawUrl: string): string {
   if (!rawUrl) return ''
   let url = rawUrl.trim().replace(/^["'<]|["'>]$/g, '')
 
+  // Handle Google Photos URL formats where params like =w1226 h945-s-no-gm might have spaces or weird characters
+  if (url.includes('googleusercontent.com') || url.includes('photos.fife.usercontent.google.com')) {
+    // If copied with spaces, e.g. "https://lh3.googleusercontent.com/pw/AP1Gcz...=w1226 h945 s no gm"
+    // Clean up spaces to dashes or proper parameter
+    if (url.includes(' ')) {
+      // Extract base URL before parameters
+      const parts = url.split('=')
+      if (parts.length > 1) {
+        const baseUrl = parts[0]
+        return `${baseUrl}=w2048`
+      }
+      url = url.replace(/\s+/g, '-')
+    }
+    // Standardize resolution parameter to high quality
+    if (!url.includes('=w') && !url.includes('=s') && !url.includes('?')) {
+      return `${url}=w2048`
+    }
+    return url
+  }
+
   // 1. Google Drive Links
   // https://drive.google.com/file/d/FILE_ID/view?usp=sharing
   // https://drive.google.com/open?id=FILE_ID
@@ -382,15 +402,6 @@ export function normalizeImageUrl(rawUrl: string): string {
   if (gDriveMatch && gDriveMatch[1]) {
     const fileId = gDriveMatch[1]
     return `https://lh3.googleusercontent.com/d/${fileId}=w2048`
-  }
-
-  // 2. Google Photos direct links (photos.fife.usercontent.google.com, lh3.googleusercontent.com)
-  if (url.includes('googleusercontent.com') || url.includes('photos.fife.usercontent.google.com')) {
-    // Clean trailing params and add high-res param
-    if (!url.includes('=w') && !url.includes('=s') && !url.includes('?')) {
-      return `${url}=w2048`
-    }
-    return url
   }
 
   // 3. Dropbox links

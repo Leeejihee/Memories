@@ -108,6 +108,8 @@ function SmartImage({
         if (active) setIsResolvingGPhotos(false)
       }
       if (active) {
+        // If it's a remote URL from known external hosts with strict referrer/hotlink policy (like googleusercontent),
+        // normalizeImageUrl has cleaned it.
         setCurrentSrc(normalized)
       }
     }
@@ -119,17 +121,22 @@ function SmartImage({
 
   const handleImgError = () => {
     const rawNormalized = normalizeImageUrl(src || '')
-    if (fallbackAttempt === 0 && currentSrc && !currentSrc.startsWith('data:') && !currentSrc.startsWith('blob:')) {
+    // Cycle through fallback proxies
+    if (fallbackAttempt === 0 && rawNormalized && !rawNormalized.startsWith('data:') && !rawNormalized.startsWith('blob:')) {
       setFallbackAttempt(1)
+      // Attempt 1: wsrv.nl proxy (handles CORS and referrers for Google Photos, Unsplash, etc.)
       setCurrentSrc(`https://wsrv.nl/?url=${encodeURIComponent(rawNormalized)}&output=webp`)
-    } else if (fallbackAttempt === 1 && currentSrc && !currentSrc.startsWith('data:')) {
+    } else if (fallbackAttempt === 1 && rawNormalized && !rawNormalized.startsWith('data:')) {
       setFallbackAttempt(2)
+      // Attempt 2: images.weserv.nl without format conversion
       setCurrentSrc(`https://images.weserv.nl/?url=${encodeURIComponent(rawNormalized)}`)
-    } else if (fallbackAttempt === 2 && currentSrc && !currentSrc.startsWith('data:')) {
+    } else if (fallbackAttempt === 2 && rawNormalized && !rawNormalized.startsWith('data:')) {
       setFallbackAttempt(3)
+      // Attempt 3: allorigins raw proxy
       setCurrentSrc(`https://api.allorigins.win/raw?url=${encodeURIComponent(rawNormalized)}`)
-    } else if (fallbackAttempt === 3 && currentSrc && !currentSrc.startsWith('data:')) {
+    } else if (fallbackAttempt === 3 && rawNormalized && !rawNormalized.startsWith('data:')) {
       setFallbackAttempt(4)
+      // Attempt 4: corsproxy.io
       setCurrentSrc(`https://corsproxy.io/?${encodeURIComponent(rawNormalized)}`)
     } else {
       setHasError(true)

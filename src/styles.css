@@ -1350,14 +1350,25 @@ header {
   align-items: center;
   justify-content: center;
   background: #191816;
-  min-height: 340px;
-  max-height: 52vh;
+  min-height: 380px;
+  max-height: 60vh;
+  width: 100%;
 }
 
 .lightbox-image {
   max-width: 100%;
-  max-height: 52vh;
+  max-height: 60vh;
+  width: auto;
+  height: auto;
   object-fit: contain;
+  display: block;
+}
+
+.lightbox-photo-stage .image-error-box {
+  min-height: 340px;
+  background: #242220;
+  color: #c4beb4;
+  border-radius: 0;
 }
 
 .lightbox-nav-btn {
