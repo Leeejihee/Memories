@@ -1,0 +1,6 @@
+{
+  "name": "My Memories",
+  "description": "A warm, personal memories and photo journal to keep and rediscover cherished moments.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

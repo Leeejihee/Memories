@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="memory_cream">#F8F6F1</color>
+    <color name="memory_terracotta">#E56D4C</color>
+    <color name="memory_ink">#292823</color>
+    <color name="memory_surface">#EEECE6</color>
+    <color name="memory_warm_card">#F1E8D9</color>
+    <color name="memory_sage">#79A98B</color>
+</resources>
