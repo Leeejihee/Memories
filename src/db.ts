@@ -1,4 +1,21 @@
-// IndexedDB Helper for high-capacity memory storage
+import { createClient, SupabaseClient } from '@supabase/supabase-js'
+import exifr from 'exifr'
+
+export interface ExifInfo {
+  make?: string
+  model?: string
+  dateTimeOriginal?: string
+  focalLength?: number
+  fNumber?: number
+  iso?: number
+  exposureTime?: number | string
+  latitude?: number
+  longitude?: number
+  software?: string
+  imageWidth?: number
+  imageHeight?: number
+}
+
 export interface MediaItem {
   id: string
   file_name: string
@@ -13,6 +30,8 @@ export interface MediaItem {
   album_id?: string | null
   location?: string | null
   created_at: string
+  user_id?: string
+  exif_data?: ExifInfo | null
 }
 
 export interface AlbumItem {
@@ -21,6 +40,21 @@ export interface AlbumItem {
   description?: string | null
   cover_media_id: string | null
   created_at: string
+  user_id?: string
+}
+
+export interface UserAccount {
+  id: string
+  email: string
+  name: string
+  passwordHash: string
+  avatar?: string
+  createdAt: string
+  supabaseConfig?: {
+    url: string
+    anonKey: string
+    syncEnabled: boolean
+  }
 }
 
 export interface UserProfile {
@@ -30,19 +64,61 @@ export interface UserProfile {
   avatar?: string
 }
 
-const DB_NAME = 'MyMemories_DB'
-const DB_VERSION = 1
+// User accounts management in separate Auth store
+const AUTH_STORAGE_KEY = 'mymemories_registered_accounts_v2'
+const CURRENT_USER_KEY = 'mymemories_current_user_v2'
+
+export function getAllRegisteredAccounts(): UserAccount[] {
+  try {
+    const raw = localStorage.getItem(AUTH_STORAGE_KEY)
+    return raw ? JSON.parse(raw) : []
+  } catch {
+    return []
+  }
+}
+
+export function saveAllRegisteredAccounts(accounts: UserAccount[]): void {
+  localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(accounts))
+}
+
+export function getPersistedCurrentUser(): UserAccount | null {
+  try {
+    const raw = localStorage.getItem(CURRENT_USER_KEY)
+    if (!raw) return null
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+export function setPersistedCurrentUser(user: UserAccount | null): void {
+  if (user) {
+    localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(user))
+  } else {
+    localStorage.removeItem(CURRENT_USER_KEY)
+  }
+}
+
+// Database helper with dynamic isolation per account
+function getDatabaseName(userIdOrEmail: string): string {
+  const sanitized = (userIdOrEmail || 'guest')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '_')
+  return `MyMemories_DB_${sanitized}`
+}
+
 const STORE_MEDIA = 'memories'
 const STORE_ALBUMS = 'albums'
 const STORE_META = 'metadata'
 
-function openDB(): Promise<IDBDatabase> {
+function openDBForAccount(userIdOrEmail: string): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (!window.indexedDB) {
-      reject(new Error('IndexedDB not supported'))
+      reject(new Error('IndexedDB không được hỗ trợ trên trình duyệt này'))
       return
     }
-    const request = indexedDB.open(DB_NAME, DB_VERSION)
+    const dbName = getDatabaseName(userIdOrEmail)
+    const request = indexedDB.open(dbName, 1)
 
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result
@@ -62,56 +138,58 @@ function openDB(): Promise<IDBDatabase> {
   })
 }
 
-export async function getAllMediaFromDB(userEmail: string): Promise<MediaItem[]> {
+// Media DB Functions
+export async function getAllMediaFromDB(userId: string): Promise<MediaItem[]> {
   try {
-    const db = await openDB()
+    const db = await openDBForAccount(userId)
     return new Promise((resolve) => {
       const tx = db.transaction(STORE_MEDIA, 'readonly')
       const store = tx.objectStore(STORE_MEDIA)
       const request = store.getAll()
       request.onsuccess = () => {
-        const list = (request.result as (MediaItem & { user_email?: string })[]) || []
-        // Filter by user email (or unassigned/guest)
-        const filtered = list.filter(item => !item.user_email || item.user_email === userEmail)
-        resolve(filtered)
+        const list = (request.result as MediaItem[]) || []
+        resolve(list)
       }
       request.onerror = () => resolve([])
     })
-  } catch {
-    // Fallback to localStorage
-    const saved = localStorage.getItem(`mymemories_data_${userEmail}`) || localStorage.getItem('mymemories_data')
+  } catch (err) {
+    console.warn('Fallback to isolated localStorage for media:', err)
+    const saved = localStorage.getItem(`mymemories_data_${userId}`)
     return saved ? JSON.parse(saved) : []
   }
 }
 
-export async function saveMediaItemToDB(item: MediaItem, userEmail: string): Promise<void> {
+export async function saveMediaItemToDB(item: MediaItem, userId: string): Promise<void> {
   try {
-    const db = await openDB()
+    const db = await openDBForAccount(userId)
     const tx = db.transaction(STORE_MEDIA, 'readwrite')
     const store = tx.objectStore(STORE_MEDIA)
-    store.put({ ...item, user_email: userEmail })
+    store.put({ ...item, user_id: userId })
   } catch (err) {
     console.error('Error saving media to IndexedDB:', err)
   }
 }
 
-export async function saveAllMediaToDB(items: MediaItem[], userEmail: string): Promise<void> {
+export async function saveAllMediaToDB(items: MediaItem[], userId: string): Promise<void> {
   try {
-    const db = await openDB()
+    const db = await openDBForAccount(userId)
     const tx = db.transaction(STORE_MEDIA, 'readwrite')
     const store = tx.objectStore(STORE_MEDIA)
-    // Clear and batch write or put
+    // Clear and batch rewrite
+    store.clear()
     for (const item of items) {
-      store.put({ ...item, user_email: userEmail })
+      store.put({ ...item, user_id: userId })
     }
   } catch (err) {
     console.error('Error saving all media:', err)
+    // Local storage backup
+    localStorage.setItem(`mymemories_data_${userId}`, JSON.stringify(items))
   }
 }
 
-export async function deleteMediaItemFromDB(id: string): Promise<void> {
+export async function deleteMediaItemFromDB(id: string, userId: string): Promise<void> {
   try {
-    const db = await openDB()
+    const db = await openDBForAccount(userId)
     const tx = db.transaction(STORE_MEDIA, 'readwrite')
     const store = tx.objectStore(STORE_MEDIA)
     store.delete(id)
@@ -120,42 +198,45 @@ export async function deleteMediaItemFromDB(id: string): Promise<void> {
   }
 }
 
-export async function getAllAlbumsFromDB(userEmail: string): Promise<AlbumItem[]> {
+// Album DB Functions
+export async function getAllAlbumsFromDB(userId: string): Promise<AlbumItem[]> {
   try {
-    const db = await openDB()
+    const db = await openDBForAccount(userId)
     return new Promise((resolve) => {
       const tx = db.transaction(STORE_ALBUMS, 'readonly')
       const store = tx.objectStore(STORE_ALBUMS)
       const request = store.getAll()
       request.onsuccess = () => {
-        const list = (request.result as (AlbumItem & { user_email?: string })[]) || []
-        const filtered = list.filter(item => !item.user_email || item.user_email === userEmail)
-        resolve(filtered)
+        const list = (request.result as AlbumItem[]) || []
+        resolve(list)
       }
       request.onerror = () => resolve([])
     })
-  } catch {
-    const saved = localStorage.getItem(`mymemories_albums_${userEmail}`) || localStorage.getItem('mymemories_albums')
+  } catch (err) {
+    console.warn('Fallback to isolated localStorage for albums:', err)
+    const saved = localStorage.getItem(`mymemories_albums_${userId}`)
     return saved ? JSON.parse(saved) : []
   }
 }
 
-export async function saveAllAlbumsToDB(albums: AlbumItem[], userEmail: string): Promise<void> {
+export async function saveAllAlbumsToDB(albums: AlbumItem[], userId: string): Promise<void> {
   try {
-    const db = await openDB()
+    const db = await openDBForAccount(userId)
     const tx = db.transaction(STORE_ALBUMS, 'readwrite')
     const store = tx.objectStore(STORE_ALBUMS)
+    store.clear()
     for (const album of albums) {
-      store.put({ ...album, user_email: userEmail })
+      store.put({ ...album, user_id: userId })
     }
   } catch (err) {
     console.error('Error saving albums to IndexedDB:', err)
+    localStorage.setItem(`mymemories_albums_${userId}`, JSON.stringify(albums))
   }
 }
 
-export async function deleteAlbumFromDB(id: string): Promise<void> {
+export async function deleteAlbumFromDB(id: string, userId: string): Promise<void> {
   try {
-    const db = await openDB()
+    const db = await openDBForAccount(userId)
     const tx = db.transaction(STORE_ALBUMS, 'readwrite')
     const store = tx.objectStore(STORE_ALBUMS)
     store.delete(id)
@@ -164,8 +245,20 @@ export async function deleteAlbumFromDB(id: string): Promise<void> {
   }
 }
 
-// Compress client uploaded images to preserve high visual quality with optimal storage
-export async function compressImageFile(file: File, maxDimension = 1600, quality = 0.85): Promise<string> {
+// Clear account database completely
+export async function clearAccountDatabase(userId: string): Promise<void> {
+  try {
+    const dbName = getDatabaseName(userId)
+    indexedDB.deleteDatabase(dbName)
+    localStorage.removeItem(`mymemories_data_${userId}`)
+    localStorage.removeItem(`mymemories_albums_${userId}`)
+  } catch (err) {
+    console.error('Error clearing database:', err)
+  }
+}
+
+// Image compression
+export async function compressImageFile(file: File, maxDimension = 1800, quality = 0.88): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = (e) => {
@@ -203,4 +296,81 @@ export async function compressImageFile(file: File, maxDimension = 1600, quality
     reader.onerror = reject
     reader.readAsDataURL(file)
   })
+}
+
+// EXIF Reader (Exchangeable Image File Format)
+export async function extractExifFromFile(file: File | Blob): Promise<ExifInfo | null> {
+  try {
+    const data = await exifr.parse(file, {
+      tiff: true,
+      exif: true,
+      gps: true,
+      jfif: true
+    })
+    if (!data) return null
+
+    let formattedDate = undefined
+    if (data.DateTimeOriginal || data.CreateDate || data.ModifyDate) {
+      const d = data.DateTimeOriginal || data.CreateDate || data.ModifyDate
+      if (d instanceof Date && !isNaN(d.getTime())) {
+        formattedDate = d.toISOString().slice(0, 10)
+      } else if (typeof d === 'string') {
+        const parts = d.split(' ')[0]?.replace(/:/g, '-')
+        if (parts && parts.length === 10) formattedDate = parts
+      }
+    }
+
+    return {
+      make: data.Make || undefined,
+      model: data.Model || undefined,
+      dateTimeOriginal: formattedDate,
+      focalLength: data.FocalLength || undefined,
+      fNumber: data.FNumber || undefined,
+      iso: data.ISO || undefined,
+      exposureTime: data.ExposureTime ? (data.ExposureTime < 1 ? `1/${Math.round(1 / data.ExposureTime)}` : `${data.ExposureTime}s`) : undefined,
+      latitude: data.latitude || undefined,
+      longitude: data.longitude || undefined,
+      software: data.Software || undefined,
+      imageWidth: data.ImageWidth || data.ExifImageWidth || undefined,
+      imageHeight: data.ImageHeight || data.ExifImageHeight || undefined
+    }
+  } catch (err) {
+    console.warn('Could not parse EXIF data:', err)
+    return null
+  }
+}
+
+// Supabase Client Manager
+export function createSupabaseInstance(url: string, anonKey: string): SupabaseClient | null {
+  try {
+    if (!url || !anonKey || !url.startsWith('https://')) return null
+    return createClient(url.trim(), anonKey.trim())
+  } catch (err) {
+    console.error('Failed to init Supabase:', err)
+    return null
+  }
+}
+
+// Test Supabase Connection
+export async function testSupabaseConnection(url: string, anonKey: string): Promise<{ success: boolean; message: string }> {
+  try {
+    const client = createSupabaseInstance(url, anonKey)
+    if (!client) return { success: false, message: 'URL hoặc Anon Key không hợp lệ (URL phải bắt đầu bằng https://).' }
+
+    // Try a simple ping / query
+    const { error } = await client.from('memories').select('id').limit(1)
+    if (error) {
+      if (error.code === '42P01') {
+        // Table doesn't exist yet, but connection is valid
+        return {
+          success: true,
+          message: 'Kết nối Supabase thành công! Lưu ý: Bảng "memories" chưa có sẵn trên Supabase, bạn có thể tạo bảng hoặc chạy đồng bộ để tự động cập nhật.'
+        }
+      }
+      return { success: false, message: `Lỗi Supabase: ${error.message}` }
+    }
+    return { success: true, message: 'Kết nối Supabase thành công! Dữ liệu sẵn sàng đồng bộ hai chiều.' }
+  } catch (err: any) {
+    return { success: false, message: err?.message || 'Không thể kết nối đến máy chủ Supabase.' }
+  }
 }
