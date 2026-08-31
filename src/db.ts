@@ -95,6 +95,11 @@ export function getPersistedCurrentUser(): UserAccount | null {
 
 export function setPersistedCurrentUser(user: UserAccount | null, rememberOnDevice: boolean = true): void {
   try {
+    // Clear legacy keys
+    localStorage.removeItem('mymemories_current_user')
+    sessionStorage.removeItem('mymemories_current_user')
+    localStorage.removeItem('mymemories_user_profile')
+
     if (user) {
       if (rememberOnDevice) {
         localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(user))

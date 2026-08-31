@@ -260,7 +260,7 @@ function App() {
         syncEnabled: currentUser.supabaseConfig?.syncEnabled || false
       })
     } else {
-      document.title = 'Memories - Tìm kỷ niệm nhanh (Đăng nhập)'
+      document.title = 'Memories - Tìm kỷ niệm nhanh'
     }
   }, [currentUser])
 
@@ -558,15 +558,36 @@ function App() {
   }
 
   const handleLogout = () => {
+    // Reset browser tab title immediately
+    document.title = 'Memories - Tìm kỷ niệm nhanh'
+
+    // Thoroughly remove session from both storage stores
     setPersistedCurrentUser(null)
     setCurrentUser(null)
+
+    // Clear all in-memory items and UI states
     setMedia([])
     setAlbums([])
     setIsLoaded(false)
     setShowAuthModal(false)
+    setShowAddModal(false)
+    setShowAddAlbumModal(false)
+    setDetailMemory(null)
+    setSlideshowActive(false)
+    setEditingAlbum(null)
+    setEditingMemory(null)
+    setQuery('')
+    setAiSearchInput('')
+    setSelectedTag(null)
+    setSelectedYear(null)
+    setSelectedAlbumId(null)
+    setActiveTab('home')
     setAuthError('')
     setAuthSuccess('')
-    showToast('Đã đăng xuất tài khoản thành công! Phiên làm việc trên thiết bị này đã kết thúc.')
+    setAuthLoginForm({ email: '', password: '' })
+    setAuthPortalTab('login')
+
+    showToast('Đã đăng xuất thành công! Bạn đã thoát khỏi tài khoản.')
   }
 
   // Handle URL Validation & Testing
@@ -2401,6 +2422,14 @@ function App() {
                   >
                     <UserPlus size={15} />
                     <span>Chuyển tài khoản</span>
+                  </button>
+                  <button
+                    className="secondary delete-btn"
+                    onClick={handleLogout}
+                    title="Đăng xuất khỏi thiết bị"
+                  >
+                    <LogOut size={15} />
+                    <span>Đăng xuất</span>
                   </button>
                 </div>
               </div>
