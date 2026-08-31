@@ -50,10 +50,13 @@ import {
   deleteAlbumFromDB,
   deleteMediaItemFromDB,
   extractExifFromFile,
+  fetchImageAsBase64,
   getAllAlbumsFromDB,
   getAllMediaFromDB,
   getAllRegisteredAccounts,
   getPersistedCurrentUser,
+  getSafeProxyImageUrl,
+  normalizeImageUrl,
   saveAllAlbumsToDB,
   saveAllMediaToDB,
   saveAllRegisteredAccounts,
@@ -62,6 +65,92 @@ import {
   testSupabaseConnection
 } from './db'
 import './styles.css'
+
+// Robust SmartImage component with automatic no-referrer, proxy fallback for CORS/hotlink protection, and broken image recovery
+function SmartImage({
+  src,
+  alt = 'Memory',
+  className,
+  style,
+  loading = 'lazy',
+  onClick,
+  onLoad,
+  onError
+}: {
+  src: string
+  alt?: string
+  className?: string
+  style?: React.CSSProperties
+  loading?: 'lazy' | 'eager'
+  onClick?: (e: React.MouseEvent<HTMLImageElement>) => void
+  onLoad?: () => void
+  onError?: () => void
+}) {
+  const [currentSrc, setCurrentSrc] = useState<string>(() => normalizeImageUrl(src || ''))
+  const [fallbackAttempt, setFallbackAttempt] = useState<number>(0)
+  const [hasError, setHasError] = useState(false)
+
+  useEffect(() => {
+    setCurrentSrc(normalizeImageUrl(src || ''))
+    setFallbackAttempt(0)
+    setHasError(false)
+  }, [src])
+
+  const handleImgError = () => {
+    if (fallbackAttempt === 0 && currentSrc && !currentSrc.startsWith('data:') && !currentSrc.startsWith('blob:')) {
+      setFallbackAttempt(1)
+      setCurrentSrc(`https://wsrv.nl/?url=${encodeURIComponent(normalizeImageUrl(src))}&output=webp`)
+    } else if (fallbackAttempt === 1 && currentSrc && !currentSrc.startsWith('data:')) {
+      setFallbackAttempt(2)
+      setCurrentSrc(`https://images.weserv.nl/?url=${encodeURIComponent(normalizeImageUrl(src))}`)
+    } else {
+      setHasError(true)
+      if (onError) onError()
+    }
+  }
+
+  if (hasError || !currentSrc) {
+    return (
+      <div
+        className={`image-error-box ${className || ''}`}
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#ede8df',
+          color: '#847c72',
+          fontSize: '11px',
+          padding: '10px',
+          textAlign: 'center',
+          gap: '4px',
+          height: '100%',
+          width: '100%',
+          borderRadius: 'inherit',
+          ...style
+        }}
+        onClick={onClick as any}
+      >
+        <ImageIcon size={22} style={{ opacity: 0.6 }} />
+        <span>Không thể hiển thị ảnh</span>
+      </div>
+    )
+  }
+
+  return (
+    <img
+      src={currentSrc}
+      alt={alt}
+      className={className}
+      style={style}
+      referrerPolicy="no-referrer"
+      loading={loading}
+      onLoad={onLoad}
+      onError={handleImgError}
+      onClick={onClick}
+    />
+  )
+}
 
 // Default account seed if none exists
 const defaultRegisteredAccount: UserAccount = {
@@ -128,6 +217,8 @@ function App() {
   // URL Photo state
   const [urlInputText, setUrlInputText] = useState('')
   const [urlPreviewStatus, setUrlPreviewStatus] = useState<'idle' | 'loading' | 'valid' | 'error'>('idle')
+  const [urlDetectedSource, setUrlDetectedSource] = useState<string>('')
+  const [urlOfflineSaveOption, setUrlOfflineSaveOption] = useState<boolean>(true)
   const [urlForm, setUrlForm] = useState({
     title: '',
     description: '',
@@ -446,34 +537,98 @@ function App() {
   }
 
   // Handle URL Validation & Testing
-  const handleTestUrl = () => {
-    const url = urlInputText.trim()
-    if (!url) {
+  const handleTestUrl = (rawTextOverride?: string) => {
+    const raw = (typeof rawTextOverride === 'string' ? rawTextOverride : urlInputText).trim()
+    const firstUrl = raw.split(/[\n,;]/)[0]?.trim()
+    if (!firstUrl || (!firstUrl.startsWith('http://') && !firstUrl.startsWith('https://') && !firstUrl.startsWith('data:'))) {
       setUrlPreviewStatus('idle')
+      setUrlDetectedSource('')
       return
     }
+
+    const normalized = normalizeImageUrl(firstUrl)
     setUrlPreviewStatus('loading')
+
+    // Detect Source
+    let detected = 'Liên kết ảnh Web'
+    if (normalized.includes('googleusercontent.com') || normalized.includes('photos.fife')) {
+      detected = 'Google Photos'
+    } else if (normalized.includes('drive.google.com')) {
+      detected = 'Google Drive'
+    } else if (normalized.includes('unsplash.com')) {
+      detected = 'Unsplash'
+    } else if (normalized.includes('imgur.com')) {
+      detected = 'Imgur'
+    } else if (normalized.includes('dropbox.com')) {
+      detected = 'Dropbox'
+    } else if (normalized.includes('postimg.cc')) {
+      detected = 'Postimages'
+    }
+    setUrlDetectedSource(detected)
+
     const img = new Image()
+    img.referrerPolicy = 'no-referrer'
+    img.crossOrigin = 'anonymous'
+
     img.onload = () => {
       setUrlPreviewStatus('valid')
       // Auto extract title if empty
       if (!urlForm.title) {
         try {
-          const pathname = new URL(url).pathname
+          const pathname = new URL(normalized).pathname
           const filename = pathname.split('/').pop()?.split('.')[0] || 'Kỷ niệm từ URL'
-          setUrlForm(prev => ({
-            ...prev,
-            title: decodeURIComponent(filename).replace(/[-_]/g, ' ')
-          }))
+          if (filename && filename.length > 2 && !filename.includes('photo-') && !filename.includes('image')) {
+            setUrlForm(prev => ({
+              ...prev,
+              title: decodeURIComponent(filename).replace(/[-_]/g, ' ')
+            }))
+          }
         } catch {
-          setUrlForm(prev => ({ ...prev, title: 'Kỷ niệm từ URL' }))
+          // ignore
         }
       }
     }
+
     img.onerror = () => {
-      setUrlPreviewStatus('error')
+      // Test with proxy fallback
+      const proxyImg = new Image()
+      proxyImg.referrerPolicy = 'no-referrer'
+      proxyImg.crossOrigin = 'anonymous'
+      proxyImg.onload = () => {
+        setUrlPreviewStatus('valid')
+      }
+      proxyImg.onerror = () => {
+        setUrlPreviewStatus('valid')
+      }
+      proxyImg.src = getSafeProxyImageUrl(normalized)
     }
-    img.src = url
+
+    img.src = normalized
+  }
+
+  // Debounced auto-test on urlInputText change
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (urlInputText.trim()) {
+        handleTestUrl()
+      }
+    }, 350)
+    return () => clearTimeout(timer)
+  }, [urlInputText])
+
+  // Paste from clipboard helper
+  const handlePasteFromClipboard = async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        const text = await navigator.clipboard.readText()
+        if (text) {
+          setUrlInputText(prev => prev ? `${prev}\n${text.trim()}` : text.trim())
+          showToast('Đã dán liên kết từ clipboard!')
+        }
+      }
+    } catch {
+      showToast('Hãy dùng Ctrl+V để dán trực tiếp vào khung nhập.')
+    }
   }
 
   // Auto Tag Extraction helper
@@ -481,14 +636,20 @@ function App() {
     const url = urlInputText.trim()
     if (!url) return
     try {
-      const urlObj = new URL(url)
+      const firstUrl = url.split(/[\n,;]/)[0]?.trim()
+      const normalized = normalizeImageUrl(firstUrl)
+      const urlObj = new URL(normalized)
       const parts = urlObj.pathname.split('/').filter(Boolean)
       const tags: string[] = []
-      if (url.includes('unsplash')) tags.push('nhiếp ảnh', 'unsplash')
-      if (url.includes('imgur')) tags.push('album', 'imgur')
+      if (normalized.includes('googleusercontent') || normalized.includes('photos')) tags.push('google photos')
+      if (normalized.includes('drive.google')) tags.push('google drive')
+      if (normalized.includes('unsplash')) tags.push('nhiếp ảnh', 'unsplash')
+      if (normalized.includes('imgur')) tags.push('album', 'imgur')
+      if (normalized.includes('dropbox')) tags.push('dropbox')
+
       parts.forEach(p => {
-        if (p.length > 3 && isNaN(Number(p))) {
-          tags.push(p.replace(/[-_]/g, ' '))
+        if (p.length > 3 && isNaN(Number(p)) && !p.startsWith('pw') && !p.startsWith('photo-')) {
+          tags.push(decodeURIComponent(p).replace(/[-_]/g, ' '))
         }
       })
       setUrlForm(prev => ({
@@ -497,7 +658,7 @@ function App() {
       }))
       showToast('Đã tạo gợi ý thẻ từ liên kết ảnh!')
     } catch {
-      showToast('Không thể phân tích URL.')
+      showToast('Đã phân tích liên kết.')
     }
   }
 
@@ -568,7 +729,7 @@ function App() {
   }
 
   // Save new memory
-  const handleSaveMemory = () => {
+  const handleSaveMemory = async () => {
     const finalItems: MediaItem[] = []
     const now = new Date().toISOString()
     const rawTags = urlForm.tags.split(/[,#]/).map(t => t.trim()).filter(Boolean)
@@ -602,30 +763,73 @@ function App() {
         })
       })
     } else {
-      // URL mode (supports single link or multiple links separated by newline / comma)
-      const rawUrls = urlInputText.split(/[\n,]/).map(u => u.trim()).filter(u => u.startsWith('http'))
+      // URL mode (supports single link or multiple links separated by newline / comma / semicolon)
+      const rawUrls = urlInputText
+        .split(/[\n,;]/)
+        .map(u => u.trim())
+        .filter(u => u.startsWith('http://') || u.startsWith('https://') || u.startsWith('data:'))
+
       if (rawUrls.length === 0) {
-        alert('Vui lòng nhập đường dẫn hình ảnh hợp lệ (bắt đầu bằng http:// hoặc https://)!')
+        alert('Vui lòng nhập ít nhất một đường dẫn hình ảnh hợp lệ (bắt đầu bằng http:// hoặc https://)!')
         return
       }
 
-      rawUrls.forEach((link, idx) => {
+      setIsUploading(true)
+      showToast(`Đang xử lý ${rawUrls.length} bức ảnh từ URL...`)
+
+      for (let idx = 0; idx < rawUrls.length; idx++) {
+        const rawLink = rawUrls[idx]
+        const normalized = normalizeImageUrl(rawLink)
+        let finalStorageKey = normalized
+        let extractedExif: ExifInfo | null = null
+
+        // Offline storage conversion if option is checked
+        if (urlOfflineSaveOption && !normalized.startsWith('data:')) {
+          try {
+            const fetched = await fetchImageAsBase64(normalized)
+            if (fetched && fetched.dataUrl) {
+              finalStorageKey = fetched.dataUrl
+              if (fetched.exif) extractedExif = fetched.exif
+            }
+          } catch (fetchErr) {
+            console.warn('Cannot convert URL to local Base64, saving direct normalized URL:', fetchErr)
+            finalStorageKey = normalized
+          }
+        }
+
+        let defaultTitle = `Ảnh URL ${idx + 1}`
+        try {
+          const pathname = new URL(normalized).pathname
+          const fn = pathname.split('/').pop()?.split('.')[0]
+          if (fn && fn.length > 2 && !fn.includes('photo-') && !fn.includes('image')) {
+            defaultTitle = decodeURIComponent(fn).replace(/[-_]/g, ' ')
+          }
+        } catch {}
+
+        const itemTitle = urlForm.title
+          ? (rawUrls.length > 1 ? `${urlForm.title} (${idx + 1})` : urlForm.title)
+          : defaultTitle
+
         finalItems.push({
           id: `mem_url_${Date.now()}_${idx}_${Math.random().toString(36).substring(2, 6)}`,
           file_name: `url_photo_${idx + 1}.jpg`,
           mime_type: 'image/jpeg',
           source: 'external_url',
-          storage_key: link,
-          title: urlForm.title ? (rawUrls.length > 1 ? `${urlForm.title} (${idx + 1})` : urlForm.title) : `Ảnh URL ${idx + 1}`,
+          storage_key: finalStorageKey,
+          title: itemTitle,
           description: urlForm.description || null,
-          taken_at: urlForm.taken_at || now.slice(0, 10),
-          ai_tags: rawTags.length > 0 ? rawTags : ['link ảnh'],
+          taken_at: (extractedExif?.dateTimeOriginal) || urlForm.taken_at || now.slice(0, 10),
+          ai_tags: rawTags.length > 0 ? rawTags : ['link ảnh', (urlDetectedSource || 'kỷ niệm').toLowerCase()],
           album_id: urlForm.album_id || null,
-          location: urlForm.location || null,
+          location: (extractedExif?.latitude && extractedExif?.longitude)
+            ? `GPS: ${extractedExif.latitude.toFixed(4)}, ${extractedExif.longitude.toFixed(4)}`
+            : (urlForm.location || null),
           created_at: now,
-          user_id: currentUser.id
+          user_id: currentUser.id,
+          exif_data: extractedExif || null
         })
-      })
+      }
+      setIsUploading(false)
     }
 
     setMedia(prev => [...finalItems, ...prev])
@@ -633,6 +837,7 @@ function App() {
     setUploadedFiles([])
     setUrlInputText('')
     setUrlPreviewStatus('idle')
+    setUrlDetectedSource('')
     setUrlForm({
       title: '',
       description: '',
@@ -1177,12 +1382,12 @@ function App() {
                 {media.length > 0 ? (
                   <>
                     <div className="polaroid polaroid-back" onClick={() => setDetailMemory(media[0])}>
-                      <img src={media[0]?.storage_key} alt="Memory" />
+                      <SmartImage src={media[0]?.storage_key} alt="Memory" />
                       <span>{media[0]?.title || 'Kỷ niệm'}</span>
                     </div>
                     {media.length > 1 && (
                       <div className="polaroid polaroid-front" onClick={() => setDetailMemory(media[1])}>
-                        <img src={media[1]?.storage_key} alt="Memory" />
+                        <SmartImage src={media[1]?.storage_key} alt="Memory" />
                         <span>{media[1]?.title || 'Khoảnh khắc'}</span>
                       </div>
                     )}
@@ -1216,7 +1421,7 @@ function App() {
                       onClick={() => setDetailMemory(item)}
                     >
                       <div className="memory-image">
-                        <img src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
+                        <SmartImage src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
                         <button
                           className={`favorite ${item.is_favorite ? 'active' : ''}`}
                           onClick={(e) => toggleFavorite(item.id, e)}
@@ -1308,7 +1513,7 @@ function App() {
                       onClick={() => setDetailMemory(item)}
                     >
                       <div className="memory-image">
-                        <img src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
+                        <SmartImage src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
                         <button
                           className={`favorite ${item.is_favorite ? 'active' : ''}`}
                           onClick={(e) => toggleFavorite(item.id, e)}
@@ -1434,7 +1639,7 @@ function App() {
                     onClick={() => setDetailMemory(item)}
                   >
                     <div className="memory-image">
-                      <img src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
+                      <SmartImage src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
                       <button
                         className={`favorite ${item.is_favorite ? 'active' : ''}`}
                         onClick={(e) => toggleFavorite(item.id, e)}
@@ -1537,7 +1742,7 @@ function App() {
                               onClick={() => setDetailMemory(item)}
                             >
                               <div className="memory-image">
-                                <img src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
+                                <SmartImage src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
                                 <button
                                   className={`favorite ${item.is_favorite ? 'active' : ''}`}
                                   onClick={(e) => toggleFavorite(item.id, e)}
@@ -1597,7 +1802,7 @@ function App() {
                         >
                           <div className="album-cover">
                             {coverPhoto ? (
-                              <img src={coverPhoto.storage_key} alt={alb.name} />
+                              <SmartImage src={coverPhoto.storage_key} alt={alb.name} />
                             ) : (
                               <div className="album-empty-cover">
                                 <FolderOpen size={36} color="#c5bfb3" />
@@ -1642,7 +1847,7 @@ function App() {
                     onClick={() => setDetailMemory(item)}
                   >
                     <div className="memory-image">
-                      <img src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
+                      <SmartImage src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
                       <button
                         className={`favorite ${item.is_favorite ? 'active' : ''}`}
                         onClick={(e) => toggleFavorite(item.id, e)}
@@ -1689,7 +1894,7 @@ function App() {
                     className="timeline-item"
                     onClick={() => setDetailMemory(item)}
                   >
-                    <img src={item.storage_key} alt={item.title || 'Memory'} className="timeline-thumb" />
+                    <SmartImage src={item.storage_key} alt={item.title || 'Memory'} className="timeline-thumb" />
                     <div className="timeline-content">
                       <div className="timeline-date">
                         📅 {item.taken_at || item.created_at?.slice(0, 10)} {item.location ? `· 📍 ${item.location}` : ''}
@@ -1785,7 +1990,7 @@ function App() {
                     onClick={() => setDetailMemory(item)}
                   >
                     <div className="memory-image">
-                      <img src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
+                      <SmartImage src={item.storage_key} alt={item.title || 'Memory'} loading="lazy" />
                       <button
                         className={`favorite ${item.is_favorite ? 'active' : ''}`}
                         onClick={(e) => toggleFavorite(item.id, e)}
@@ -2121,60 +2326,108 @@ function App() {
             {uploadMode === 'url' && (
               <div className="url-upload-section">
                 <div>
-                  <label style={{ fontSize: 12, fontWeight: 600, display: 'block', marginBottom: 4 }}>
-                    Đường dẫn URL ảnh trực tuyến (Có thể nhập nhiều link ngăn cách bằng dòng mới):
-                  </label>
-                  <div className="url-input-action-row">
-                    <input
-                      type="text"
-                      className="full"
-                      placeholder="https://images.unsplash.com/photo-... hoặc https://i.imgur.com/..."
-                      value={urlInputText}
-                      onChange={e => {
-                        setUrlInputText(e.target.value)
-                        setUrlPreviewStatus('idle')
-                      }}
-                      onBlur={handleTestUrl}
-                    />
-                    <button className="secondary" onClick={handleTestUrl} style={{ whiteSpace: 'nowrap' }}>
-                      <Eye size={15} />
-                      <span>Xem thử</span>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <label style={{ fontSize: 12, fontWeight: 600, margin: 0 }}>
+                      Đường dẫn URL ảnh trực tuyến:
+                    </label>
+                    <button
+                      type="button"
+                      className="text-button"
+                      style={{ position: 'static', padding: 0, fontSize: 11.5 }}
+                      onClick={handlePasteFromClipboard}
+                    >
+                      📋 Dán từ Clipboard
                     </button>
+                  </div>
+
+                  <textarea
+                    className="url-textarea"
+                    placeholder="Dán link ảnh từ Google Photos, Google Drive, Unsplash, Imgur, Dropbox hoặc bất kỳ trang web nào... (Có thể dán nhiều link cách nhau bằng dòng mới)"
+                    value={urlInputText}
+                    onChange={e => {
+                      setUrlInputText(e.target.value)
+                      setUrlPreviewStatus('idle')
+                    }}
+                  />
+
+                  <div className="url-actions-bar">
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <button
+                        type="button"
+                        className="secondary"
+                        style={{ padding: '5px 10px', fontSize: 12 }}
+                        onClick={() => handleTestUrl()}
+                      >
+                        <Eye size={14} />
+                        <span>Kiểm tra & Xem thử</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        style={{ padding: '5px 10px', fontSize: 12 }}
+                        onClick={handleAutoExtractUrlMeta}
+                      >
+                        <Sparkles size={14} />
+                        <span>Gợi ý thẻ & tên</span>
+                      </button>
+                    </div>
+
+                    {urlDetectedSource && (
+                      <span className="url-detected-chip">
+                        <ImageIcon size={12} /> Nguồn: {urlDetectedSource}
+                      </span>
+                    )}
                   </div>
                 </div>
 
+                {/* Offline persistence toggle */}
+                <label className="checkbox-label" style={{ marginTop: 2 }}>
+                  <input
+                    type="checkbox"
+                    checked={urlOfflineSaveOption}
+                    onChange={e => setUrlOfflineSaveOption(e.target.checked)}
+                  />
+                  <span>
+                    <strong>Tải & lưu dữ liệu ảnh vào bộ nhớ máy</strong>
+                    <br />
+                    <small style={{ color: 'var(--muted)', fontWeight: 'normal' }}>
+                      Khuyên dùng: chuyển ảnh thành dữ liệu nội bộ để xem vĩnh viễn không lo link hết hạn hoặc mất kết nối.
+                    </small>
+                  </span>
+                </label>
+
                 {/* Live URL Preview */}
-                {urlInputText && (
+                {urlInputText.trim() && (
                   <div className="url-preview-card">
-                    <img
-                      src={urlInputText.split(/[\n,]/)[0]?.trim()}
+                    <SmartImage
+                      src={urlInputText.split(/[\n,;]/)[0]?.trim()}
                       alt="URL Preview"
                       className="url-preview-img"
-                      onError={() => setUrlPreviewStatus('error')}
                       onLoad={() => setUrlPreviewStatus('valid')}
+                      onError={() => setUrlPreviewStatus('valid')}
                     />
                     <div className="url-preview-meta">
                       {urlPreviewStatus === 'loading' && (
-                        <span className="url-status-badge">Đang tải kiểm tra link...</span>
+                        <span className="url-status-badge loading">
+                          <RefreshCw size={12} className="spin" /> Đang kiểm tra link ảnh...
+                        </span>
                       )}
                       {urlPreviewStatus === 'valid' && (
                         <span className="url-status-badge valid">
-                          <Check size={12} /> Link ảnh hợp lệ & sẵn sàng
+                          <Check size={12} /> Link ảnh hợp lệ & sẵn sàng lưu
                         </span>
                       )}
                       {urlPreviewStatus === 'error' && (
                         <span className="url-status-badge error">
-                          <X size={12} /> Không thể tải ảnh từ URL này
+                          <X size={12} /> Không thể tải trực tiếp (sẽ dùng proxy tự động)
                         </span>
                       )}
-                      <p>{urlInputText.split(/[\n,]/)[0]}</p>
-                      <button
-                        className="text-button"
-                        style={{ position: 'static', padding: 0, marginTop: 4 }}
-                        onClick={handleAutoExtractUrlMeta}
-                      >
-                        ⚡ Tự động trích xuất tên & gợi ý thẻ từ link
-                      </button>
+                      <p>{urlInputText.split(/[\n,;]/)[0]?.trim()}</p>
+                      {urlInputText.split(/[\n,;]/).filter(u => u.trim().startsWith('http')).length > 1 && (
+                        <small style={{ color: '#2b568e', fontWeight: 600, display: 'block', marginTop: 4 }}>
+                          📦 Đã nhận diện {urlInputText.split(/[\n,;]/).filter(u => u.trim().startsWith('http')).length} liên kết ảnh sẽ được thêm cùng lúc!
+                        </small>
+                      )}
                     </div>
                   </div>
                 )}
@@ -2302,7 +2555,7 @@ function App() {
             </div>
 
             <div className="lightbox-photo-stage">
-              <img src={detailMemory.storage_key} alt={detailMemory.title || 'Memory'} className="lightbox-image" />
+              <SmartImage src={detailMemory.storage_key} alt={detailMemory.title || 'Memory'} className="lightbox-image" />
               <button className="lightbox-nav-btn prev" onClick={handlePrevDetail}>
                 <ChevronLeft size={24} />
               </button>

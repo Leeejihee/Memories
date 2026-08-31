@@ -351,6 +351,128 @@ export function createSupabaseInstance(url: string, anonKey: string): SupabaseCl
   }
 }
 
+// URL Image Normalizer & Direct link resolver
+export function normalizeImageUrl(rawUrl: string): string {
+  if (!rawUrl) return ''
+  let url = rawUrl.trim().replace(/^["'<]|["'>]$/g, '')
+
+  // 1. Google Drive Links
+  // https://drive.google.com/file/d/FILE_ID/view?usp=sharing
+  // https://drive.google.com/open?id=FILE_ID
+  // https://drive.google.com/uc?export=view&id=FILE_ID
+  const gDriveMatch = url.match(/drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?(?:export=view&)?id=)([a-zA-Z0-9_-]+)/)
+  if (gDriveMatch && gDriveMatch[1]) {
+    const fileId = gDriveMatch[1]
+    return `https://lh3.googleusercontent.com/d/${fileId}=w2048`
+  }
+
+  // 2. Google Photos direct links (photos.fife.usercontent.google.com, lh3.googleusercontent.com)
+  if (url.includes('googleusercontent.com') || url.includes('photos.fife.usercontent.google.com')) {
+    // If it has no size parameter, add high res parameter for best viewing
+    if (!url.includes('=w') && !url.includes('=s') && !url.includes('?')) {
+      return `${url}=w2048`
+    }
+    return url
+  }
+
+  // 3. Dropbox links
+  if (url.includes('dropbox.com')) {
+    if (url.includes('dl=0')) {
+      return url.replace('dl=0', 'raw=1')
+    }
+    if (!url.includes('raw=1')) {
+      const separator = url.includes('?') ? '&' : '?'
+      return `${url}${separator}raw=1`
+    }
+    return url
+  }
+
+  // 4. Imgur links (imgur.com/abc -> i.imgur.com/abc.jpg)
+  if (url.includes('imgur.com') && !url.includes('i.imgur.com')) {
+    const imgurMatch = url.match(/imgur\.com\/(?:gallery\/|a\/)?([a-zA-Z0-9]+)/)
+    if (imgurMatch && imgurMatch[1]) {
+      return `https://i.imgur.com/${imgurMatch[1]}.jpg`
+    }
+  }
+
+  // 5. Flickr static photo links or Postimg
+  if (url.includes('postimg.cc') && !url.includes('i.postimg.cc')) {
+    const postimgMatch = url.match(/postimg\.cc\/([a-zA-Z0-9]+)/)
+    if (postimgMatch && postimgMatch[1]) {
+      return `https://i.postimg.cc/${postimgMatch[1]}/image.jpg`
+    }
+  }
+
+  return url
+}
+
+// Safe CORS Proxy Image Generator for anti-hotlink servers
+export function getSafeProxyImageUrl(url: string): string {
+  const normalized = normalizeImageUrl(url)
+  if (!normalized || normalized.startsWith('data:') || normalized.startsWith('blob:')) {
+    return normalized
+  }
+  // Use high-performance wsrv.nl proxy as transparent fallback
+  return `https://wsrv.nl/?url=${encodeURIComponent(normalized)}&default=${encodeURIComponent(normalized)}`
+}
+
+// Convert URL Image to Base64 (Local Offline Persistence)
+export async function fetchImageAsBase64(imageUrl: string): Promise<{ dataUrl: string; exif?: ExifInfo | null }> {
+  const normalized = normalizeImageUrl(imageUrl)
+
+  // Try direct fetch first
+  const tryFetch = async (targetUrl: string): Promise<Blob> => {
+    const res = await fetch(targetUrl, {
+      mode: 'cors',
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer'
+    })
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`)
+    return await res.blob()
+  }
+
+  let blob: Blob | null = null
+
+  try {
+    blob = await tryFetch(normalized)
+  } catch {
+    // If direct fetch fails due to CORS, use proxy
+    try {
+      const proxyUrl = `https://wsrv.nl/?url=${encodeURIComponent(normalized)}&output=webp`
+      blob = await tryFetch(proxyUrl)
+    } catch {
+      // Secondary fallback
+      const proxyUrl2 = `https://api.allorigins.win/raw?url=${encodeURIComponent(normalized)}`
+      blob = await tryFetch(proxyUrl2)
+    }
+  }
+
+  if (!blob) {
+    throw new Error('Không thể tải dữ liệu ảnh từ URL này')
+  }
+
+  // Extract EXIF if present
+  let exif: ExifInfo | null = null
+  try {
+    exif = await extractExifFromFile(blob)
+  } catch (e) {
+    console.warn('Cannot extract EXIF from downloaded URL:', e)
+  }
+
+  // Convert blob to Base64 Data URL
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onloadend = () => {
+      resolve({
+        dataUrl: reader.result as string,
+        exif
+      })
+    }
+    reader.onerror = reject
+    reader.readAsDataURL(blob!)
+  })
+}
+
 // Test Supabase Connection
 export async function testSupabaseConnection(url: string, anonKey: string): Promise<{ success: boolean; message: string }> {
   try {
